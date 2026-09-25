@@ -1,18 +1,13 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*.class
+*$py.class
+*.so
 
 # OS artifacts
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Large dataset files and raw outputs (> 100MB)
-dataset/
-*.tsv
-*.zip
-*.tar.gz
 
 # Environment and IDE
 .env
@@ -24,3 +19,19 @@ venv/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints
+
+# Datasets (strictly ignored)
+dataset/
+**/dataset/
+*.tsv
+
+# Outputs and submission archives (> 100MB)
+output/
+**/output/
+submission/
+**/submission/
+*.zip
+
+# Scratch and temporary scripts
+scratch_*.py
+scratch/

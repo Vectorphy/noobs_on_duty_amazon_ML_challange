@@ -1,7 +1,5 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** noobs_on_duty  
-**Team Members:** Pranav Dudhal (Team Leader), Sarthak Ojha, Kunal Dhamal, Manish Mukund Bhoir  
 **Submission Date:** September 2026  
 
 ---

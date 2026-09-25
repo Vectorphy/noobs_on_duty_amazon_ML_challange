@@ -1,7 +1,6 @@
 # Business Entity Resolution Pipeline
 
 **Amazon ML Challenge 2026**  
-**Team:** noobs_on_duty  
 
 ---
 
