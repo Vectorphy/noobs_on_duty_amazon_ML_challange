@@ -1,0 +1,58 @@
+{
+  "sample_entities": 6000,
+  "candidate_universe_size": 68821,
+  "total_candidate_pairs": 170620,
+  "blocking_recall": 1.0,
+  "optimal_threshold": 0.5,
+  "peak_macro_f05": 0.9929541121559683,
+  "val_metrics_table": [
+    {
+      "threshold": 0.5,
+      "pair_precision": 0.9958585536795158,
+      "pair_recall": 0.9895536562203229,
+      "pair_f05": 0.9945911549475024,
+      "macro_f05": 0.9929541121559683
+    },
+    {
+      "threshold": 0.65,
+      "pair_precision": 0.9964777457572846,
+      "pair_recall": 0.9851218740107629,
+      "pair_f05": 0.9941856750367388,
+      "macro_f05": 0.9911953400141316
+    },
+    {
+      "threshold": 0.75,
+      "pair_precision": 0.9964675658317277,
+      "pair_recall": 0.9822728711617601,
+      "pair_f05": 0.9935959013768813,
+      "macro_f05": 0.9904512461450379
+    },
+    {
+      "threshold": 0.82,
+      "pair_precision": 0.9974210186976145,
+      "pair_recall": 0.9794238683127572,
+      "pair_f05": 0.9937688700456093,
+      "macro_f05": 0.9903259388214547
+    },
+    {
+      "threshold": 0.88,
+      "pair_precision": 0.9974068071312804,
+      "pair_recall": 0.9740424184868629,
+      "pair_f05": 0.9926446867539841,
+      "macro_f05": 0.9887287433295915
+    },
+    {
+      "threshold": 0.92,
+      "pair_precision": 0.9980411361410382,
+      "pair_recall": 0.9677113010446344,
+      "pair_f05": 0.9918240218026085,
+      "macro_f05": 0.9875517518293241
+    }
+  ],
+  "accessed_files": [
+    "C:\\Users\\Vector\\OneDrive\\Desktop\\CR\\amazon ML challange\\student_resource\\dataset\\train\\train_source1.tsv",
+    "C:\\Users\\Vector\\OneDrive\\Desktop\\CR\\amazon ML challange\\student_resource\\dataset\\train\\train_ground_truth.tsv",
+    "C:\\Users\\Vector\\OneDrive\\Desktop\\CR\\amazon ML challange\\student_resource\\dataset\\train\\train_source3.tsv",
+    "C:\\Users\\Vector\\OneDrive\\Desktop\\CR\\amazon ML challange\\student_resource\\dataset\\train\\train_source2.tsv"
+  ]
+}

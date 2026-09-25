@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Large dataset files and raw outputs (> 100MB)
+dataset/
+*.tsv
+*.zip
+*.tar.gz
+
+# Environment and IDE
+.env
+.venv/
+env/
+venv/
+.idea/
+.vscode/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
