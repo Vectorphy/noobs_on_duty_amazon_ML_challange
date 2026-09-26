@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -24,11 +26,13 @@ def build_database(test_dir: Path, work: Path) -> duckdb.DuckDBPyConnection:
     work.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(work / "test_v2.duckdb"))
     # Use 15 of the 16 available logical threads for disk-backed index and
-    # candidate operations. The active run must be restarted for this to apply.
+    # candidate operations.
     con.execute("SET threads=15")
-    con.execute("SET memory_limit='1536MB'")
-    con.execute(f"SET temp_directory={quoted(work / 'spill')}")
-    con.execute("SET max_temp_directory_size='20GB'")
+    con.execute("SET memory_limit='3GB'")
+    spill = Path(tempfile.gettempdir()) / f"business_entity_resolution_v2_spill_{os.getpid()}"
+    spill.mkdir(parents=True, exist_ok=True)
+    con.execute(f"SET temp_directory={quoted(spill)}")
+    con.execute("SET max_temp_directory_size='12GB'")
     con.create_function("block_keys", block_keys, ["VARCHAR", "VARCHAR"], "VARCHAR[]")
     csv = "delim='\\t', header=true, all_varchar=true, quote='', strict_mode=true"
     s1path = quoted(test_dir / "test_source1.tsv")
@@ -213,10 +217,10 @@ def main() -> None:
     if config["candidate_cap_per_source"] != 24:
         raise ValueError("This baseline runner is frozen to the validated cap of 24 per source")
     columns = tuple(config["feature_indices"])
-    work = artifacts/"test_work_15threads"
+    work = Path(tempfile.gettempdir()) / f"business_entity_resolution_v2_test_{os.getpid()}"
     resources = shutil.disk_usage(artifacts).free / 2**30
-    if resources < 25:
-        raise RuntimeError(f"Need 25 GiB free disk for test inference; found {resources:.1f} GiB")
+    if resources < 20:
+        raise RuntimeError(f"Need 20 GiB free disk for test inference; found {resources:.1f} GiB")
     con = build_database(args.test_dir,work)
     try:
         probabilities = extract_and_score(con,model,columns,work)

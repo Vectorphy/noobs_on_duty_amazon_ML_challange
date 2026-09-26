@@ -20,9 +20,13 @@ The training files default to `student_resource/dataset/train/`. Use
 `--train-dir` and `--artifacts-dir` to change those paths. The run requires at
 least 3.5 GiB available RAM and 25 GiB free disk at its start. Its DuckDB work
 database and feature arrays stay under `artifacts/v2/work/`; test inference uses
-the separate `artifacts/v2/test_work_15threads/` directory. Completed import,
-blocking, candidate partitions, and extracted features can be reused after an
-interrupted run. Allow substantial CPU time for the full corpus.
+15 DuckDB threads, a 3 GiB memory limit, and a 12 GiB spill limit. Test
+inference checks for 20 GiB free disk and puts its database, intermediate
+arrays, and spill files in a unique process-specific folder under the system
+temporary directory. Its final outputs stay under
+`artifacts/v2/test_output/`. Completed training import, blocking, candidate
+partitions, and extracted features can be reused after an interrupted run.
+Allow substantial CPU time for the full corpus.
 
 The finished run writes `artifacts/v2/matcher_model.joblib`,
 `model_config.json`, `training_metrics.json`, and `split_assignments.parquet`.
