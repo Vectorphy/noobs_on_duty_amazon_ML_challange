@@ -15,12 +15,24 @@ import math
 import os
 import shutil
 import time
+import concurrent.futures
 from pathlib import Path
 
 import duckdb
 import joblib
 import numpy as np
 from lightgbm import LGBMClassifier
+
+try:
+    # gpu_connection wraps the vector-gpu-engine duckdb_gpu binary in
+    # --serve mode with IEEE FP64 enforcement (gpu_fast_math=false,
+    # gpu_precision_relaxation=false) and the GPU-resident column cache
+    # enabled (gpu_stream_pipeline=true). Falls back to plain duckdb when
+    # the binary is absent so the pipeline runs unmodified on CPU.
+    import gpu_connection as _gpu_connection
+    _HAS_GPU_CONNECTION = True
+except ImportError:
+    _HAS_GPU_CONNECTION = False
 
 from matching_v2 import (
     ABLATION_GROUPS, BASE_FEATURES, FEATURES, KEY_S1_LIMITS,
@@ -91,12 +103,37 @@ def preflight(data_dir: Path, artifacts: Path) -> dict:
 
 
 def connect(work: Path) -> duckdb.DuckDBPyConnection:
+    """Open a DuckDB connection backed by the GPU engine when available.
+
+    When the vector-gpu-engine duckdb_gpu binary is present, returns a
+    HybridConnection that:
+      - Routes Python-UDF SQL (block_keys) to the duckdb-python CPU engine.
+      - Routes heavy relational SQL (candidate joins, Jaro-Winkler scoring)
+        to the duckdb_gpu subprocess with GPU offload.
+      - Enforces strict IEEE FP64 (gpu_fast_math=false,
+        gpu_precision_relaxation=false, no --use_fast_math in NVRTC).
+      - Enables the GPU-resident column cache (gpu_stream_pipeline=true) so
+        repeated candidate-join scans skip PCIe re-upload.
+
+    Falls back to a plain duckdb.connect() when the binary is absent.
+    """
     work.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(work / "pipeline.duckdb"))
-    con.execute("SET threads=4")
-    con.execute("SET memory_limit='1536MB'")
-    con.execute(f"SET temp_directory={quoted(work / 'spill')}")
-    con.execute("SET max_temp_directory_size='20GB'")
+    spill = work / "spill"
+    db_path = work / "pipeline.duckdb"
+    if _HAS_GPU_CONNECTION:
+        con = _gpu_connection.connect(
+            db_path=db_path,
+            threads=4,
+            memory_limit="1536MB",
+            spill_dir=spill,
+            max_temp_directory_size="20GB",
+        )
+    else:
+        con = duckdb.connect(str(db_path))
+        con.execute("SET threads=4")
+        con.execute("SET memory_limit='1536MB'")
+        con.execute(f"SET temp_directory={quoted(spill)}")
+        con.execute("SET max_temp_directory_size='20GB'")
     con.create_function("block_keys", block_keys, ["VARCHAR", "VARCHAR"], "VARCHAR[]")
     return con
 
@@ -266,36 +303,33 @@ def build_candidates(con: duckdb.DuckDBPyConnection, work: Path) -> dict:
     for part in range(32):
         if part in done:
             continue
-        con.execute("BEGIN TRANSACTION")
-        try:
-            con.execute(f"""
-            INSERT INTO candidates
-            WITH pairs AS (
-                SELECT DISTINCT sk.s1_ix, tk.target_ix
-                FROM s1_keys sk JOIN target_keys tk USING(country,key)
-                WHERE sk.s1_ix % 32 = {part}
-            ), scored AS (
-                SELECT p.s1_ix,p.target_ix,t.source_no,t.entity_id target_id,
-                       CAST(CASE WHEN s.business_address<>'' AND t.business_address<>''
-                           THEN 0.65*jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
-                              + 0.35*jaro_winkler_similarity(lower(s.business_address),lower(t.business_address))
-                           ELSE jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
-                       END AS REAL) rank_score
-                FROM pairs p JOIN s1 s ON p.s1_ix=s.ix
-                             JOIN targets t ON p.target_ix=t.ix
-            ), ranked AS (
-                SELECT *, row_number() OVER (
-                    PARTITION BY s1_ix,source_no ORDER BY rank_score DESC,target_id
-                ) rank FROM scored
-            )
-            SELECT s1_ix,target_ix,source_no,CAST(rank AS TINYINT),rank_score
-            FROM ranked WHERE rank<={MAX_CANDIDATES_PER_SOURCE}
-            """)
-            con.execute("INSERT INTO candidate_parts VALUES (?)",[part])
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
-            raise
+        # DuckDB transactions cannot span across CPU/GPU engine hand-offs
+        # because the connection is closed. We make this idempotent instead.
+        con.execute(f"DELETE FROM candidates WHERE s1_ix % 32 = {part}")
+        con.execute(f"""
+        INSERT INTO candidates
+        WITH pairs AS (
+            SELECT DISTINCT sk.s1_ix, tk.target_ix
+            FROM s1_keys sk JOIN target_keys tk USING(country,key)
+            WHERE sk.s1_ix % 32 = {part}
+        ), scored AS (
+            SELECT p.s1_ix,p.target_ix,t.source_no,t.entity_id target_id,
+                   CAST(CASE WHEN s.business_address<>'' AND t.business_address<>''
+                       THEN 0.65*jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
+                          + 0.35*jaro_winkler_similarity(lower(s.business_address),lower(t.business_address))
+                       ELSE jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
+                   END AS REAL) rank_score
+            FROM pairs p JOIN s1 s ON p.s1_ix=s.ix
+                         JOIN targets t ON p.target_ix=t.ix
+        ), ranked AS (
+            SELECT *, row_number() OVER (
+                PARTITION BY s1_ix,source_no ORDER BY rank_score DESC,target_id
+            ) rank FROM scored
+        )
+        SELECT s1_ix,target_ix,source_no,CAST(rank AS TINYINT),rank_score
+        FROM ranked WHERE rank<={MAX_CANDIDATES_PER_SOURCE}
+        """)
+        con.execute("INSERT INTO candidate_parts VALUES (?)",[part])
         if part == 0:
             elapsed = time.monotonic() - started
             log(f"First candidate partition: {count(con, 'candidates'):,} pairs in {elapsed:.1f}s; ~{elapsed*32/3600:.1f}h at this pace")
@@ -362,14 +396,17 @@ def extract_features(con: duckdb.DuckDBPyConnection, work: Path, name: str,
     meta = np.lib.format.open_memmap(meta_path, mode="w+", dtype=META_DTYPE, shape=(n,))
     cursor = con.execute(pair_query(table, split, cap))
     offset = 0
-    while rows := cursor.fetchmany(BATCH):
-        for row in rows:
-            s1_ix,target_ix,rank,source,positive,name1,addr1,name2,addr2 = row
-            x[offset] = pair_features(name1,addr1,name2,addr2,source)
-            meta[offset] = (s1_ix,target_ix,rank,source,positive)
-            offset += 1
-        if offset // 500_000 != (offset-len(rows)) // 500_000:
-            log(f"{name} features: {offset:,}/{n:,}")
+    def _process_row(row):
+        return pair_features(row[5], row[6], row[7], row[8], row[3]), (row[0], row[1], row[2], row[3], row[4])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
+        while rows := cursor.fetchmany(BATCH):
+            for feat, met in executor.map(_process_row, rows):
+                x[offset] = feat
+                meta[offset] = met
+                offset += 1
+            if offset // 500_000 != (offset-len(rows)) // 500_000:
+                log(f"{name} features: {offset:,}/{n:,}")
     if offset != n:
         raise ValueError(f"{name} query returned {offset} rows, expected {n}")
     x.flush()

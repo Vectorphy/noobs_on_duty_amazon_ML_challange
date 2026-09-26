@@ -12,6 +12,15 @@ import duckdb
 import joblib
 import numpy as np
 
+try:
+    # gpu_connection provides IEEE FP64-enforced GPU-accelerated DuckDB
+    # (gpu_fast_math=false, gpu_precision_relaxation=false,
+    # gpu_stream_pipeline=true).  Falls back to plain duckdb when absent.
+    import gpu_connection as _gpu_connection
+    _HAS_GPU_CONNECTION = True
+except ImportError:
+    _HAS_GPU_CONNECTION = False
+
 from matching_v2 import KEY_S1_LIMITS, KEY_TARGET_LIMIT, block_keys, pair_features
 from train_v2 import BATCH, MAX_CANDIDATES_PER_SOURCE, quoted
 
@@ -22,13 +31,30 @@ def log(message: str) -> None:
 
 def build_database(test_dir: Path, work: Path) -> duckdb.DuckDBPyConnection:
     work.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(work / "test_v2.duckdb"))
-    # Use 15 of the 16 available logical threads for disk-backed index and
-    # candidate operations. The active run must be restarted for this to apply.
-    con.execute("SET threads=15")
-    con.execute("SET memory_limit='1536MB'")
-    con.execute(f"SET temp_directory={quoted(work / 'spill')}")
-    con.execute("SET max_temp_directory_size='20GB'")
+    spill = work / "spill"
+    db_path = work / "test_v2.duckdb"
+    if _HAS_GPU_CONNECTION:
+        # GPU subprocess connection:
+        #   - gpu_fast_math = false           (IEEE FP64; no --use_fast_math)
+        #   - gpu_precision_relaxation = false (strict double; no fp32 downcast)
+        #   - gpu_stream_pipeline = true      (GPU-resident column cache enabled)
+        # block_keys Python UDF is routed to the CPU duckdb-python side of
+        # the HybridConnection; Jaro-Winkler candidate scoring SQL goes to GPU.
+        con = _gpu_connection.connect(
+            db_path=db_path,
+            threads=15,
+            memory_limit="1536MB",
+            spill_dir=spill,
+            max_temp_directory_size="20GB",
+        )
+    else:
+        con = duckdb.connect(str(db_path))
+        # Use 15 of the 16 available logical threads for disk-backed index and
+        # candidate operations. The active run must be restarted for this to apply.
+        con.execute("SET threads=15")
+        con.execute("SET memory_limit='1536MB'")
+        con.execute(f"SET temp_directory={quoted(spill)}")
+        con.execute("SET max_temp_directory_size='20GB'")
     con.create_function("block_keys", block_keys, ["VARCHAR", "VARCHAR"], "VARCHAR[]")
     csv = "delim='\\t', header=true, all_varchar=true, quote='', strict_mode=true"
     s1path = quoted(test_dir / "test_source1.tsv")
