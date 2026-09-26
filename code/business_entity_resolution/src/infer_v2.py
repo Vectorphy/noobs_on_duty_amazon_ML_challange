@@ -14,7 +14,7 @@ import duckdb
 import joblib
 import numpy as np
 
-from matching_v2 import KEY_S1_LIMITS, KEY_TARGET_LIMIT, block_keys, pair_features
+from matching_v2 import KEY_S1_LIMITS, KEY_TARGET_LIMIT, block_keys, pair_features_batch
 from train_v2 import BATCH, MAX_CANDIDATES_PER_SOURCE, quoted
 
 
@@ -149,9 +149,8 @@ def extract_and_score(con: duckdb.DuckDBPyConnection, model: object,
     offset = 0
     while rows := cursor.fetchmany(BATCH):
         stop = offset + len(rows)
-        for i, row in enumerate(rows, offset):
-            _,_,source,name1,addr1,name2,addr2 = row
-            features[i] = pair_features(name1,addr1,name2,addr2,source)[list(columns)]
+        batch_features = pair_features_batch(rows, workers=8)
+        features[offset:stop] = batch_features[:, list(columns)]
         probabilities[offset:stop] = model.predict_proba(features[offset:stop])[:,1]
         offset = stop
         if offset and offset % 500_000 < BATCH:

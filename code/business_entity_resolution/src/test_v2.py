@@ -10,7 +10,7 @@ from uuid import uuid4
 import numpy as np
 
 import train_v2
-from matching_v2 import FEATURES, block_keys, f05, pair_features
+from matching_v2 import FEATURES, block_keys, f05, pair_features, pair_features_batch
 
 
 class V2Check(unittest.TestCase):
@@ -60,6 +60,16 @@ class V2Check(unittest.TestCase):
                 con.close()
             self.assertEqual(len(FEATURES), len(pair_features("A", "10 Road", "A", "10 Road", 3)))
             self.assertEqual(pair_features("A", "10 Road", "A", "10 Road", 3)[-1], 1)
+            sample_pairs = [
+                (0, 0, 2, "Widget Inc", "11 Market Road", "Widget", "11 Market Rd"),
+                (1, 2, 3, "München Café", "", "Munchen Cafe", ""),
+                (2, 1, 2, "North Star LLC", "10 Park Ave", "North Star", "22 Park Ave"),
+            ]
+            np.testing.assert_allclose(
+                pair_features_batch(sample_pairs, workers=2),
+                np.stack([pair_features(r[3],r[4],r[5],r[6],r[2]) for r in sample_pairs]),
+                rtol=0, atol=1e-5,
+            )
             self.assertTrue(block_keys("Widget 1", "11 Market Road"))
             np.testing.assert_allclose(f05(np.array([0,1,2]),np.array([0,0,2]),np.array([0,0,1])), [1,0,.5])
         finally:

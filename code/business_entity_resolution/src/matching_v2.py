@@ -10,7 +10,7 @@ import re
 import unicodedata
 
 import numpy as np
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 
 
 STOP_WORDS = {
@@ -104,7 +104,8 @@ def clean_company_name(value: str) -> str:
     return "".join(word for word in value.split() if word not in STOP_WORDS)
 
 
-def pair_features(name1: str, addr1: str, name2: str, addr2: str, source: int) -> np.ndarray:
+def pair_features(name1: str, addr1: str, name2: str, addr2: str, source: int,
+                  fuzzy_scores: tuple[float, ...] | None = None) -> np.ndarray:
     """Return the old 15 training features followed by five v2 features."""
     name1, name2 = name1 or "", name2 or ""
     addr1, addr2 = addr1 or "", addr2 or ""
@@ -117,12 +118,17 @@ def pair_features(name1: str, addr1: str, name2: str, addr2: str, source: int) -
     clean1, clean2 = clean_company_name(name1), clean_company_name(name2)
     shared = len(nums1 & nums2)
     non_latin = any(ord(ch) > 0x024F for ch in name1 + name2 if ch.isalpha())
+    if fuzzy_scores is None:
+        name_scores = (fuzz.ratio(n1, n2), fuzz.token_sort_ratio(n1, n2), fuzz.token_set_ratio(n1, n2))
+        addr_scores = (
+            fuzz.ratio(a1, a2), fuzz.token_sort_ratio(a1, a2), fuzz.token_set_ratio(a1, a2)
+        ) if both_addr else (0.0, 0.0, 0.0)
+    else:
+        name_scores, addr_scores = fuzzy_scores[:3], fuzzy_scores[3:]
     out = [
-        fuzz.ratio(n1, n2), fuzz.token_sort_ratio(n1, n2), fuzz.token_set_ratio(n1, n2),
+        *name_scores,
         jaccard(w1, w2), abs(len(n1) - len(n2)) / max(len(n1), len(n2), 1),
-        fuzz.ratio(a1, a2) if both_addr else 0.0,
-        fuzz.token_sort_ratio(a1, a2) if both_addr else 0.0,
-        fuzz.token_set_ratio(a1, a2) if both_addr else 0.0,
+        *addr_scores,
         jaccard(aw1, aw2) if both_addr else 0.0,
         float(shared), float(shared > 0), float(not both_addr), float(non_latin),
         float(len(clean1) >= 4 and len(clean2) >= 4 and (clean1 in clean2 or clean2 in clean1)),
@@ -134,6 +140,31 @@ def pair_features(name1: str, addr1: str, name2: str, addr2: str, source: int) -
         float(source == 3),
     ]
     return np.asarray(out, dtype=np.float32)
+
+
+def pair_features_batch(rows: list[tuple], workers: int = 8) -> np.ndarray:
+    """Build unchanged pair features while batching parallel RapidFuzz scorers."""
+    if not rows:
+        return np.empty((0, len(FEATURES)), dtype=np.float32)
+    names1 = [(row[3] or "").lower() for row in rows]
+    names2 = [(row[5] or "").lower() for row in rows]
+    addrs1 = [(row[4] or "").lower() for row in rows]
+    addrs2 = [(row[6] or "").lower() for row in rows]
+    has_both_addresses = [bool(a.strip() and b.strip()) for a, b in zip(addrs1, addrs2)]
+    workers = max(1, min(workers, len(rows)))
+
+    def scores(left: list[str], right: list[str]) -> list[np.ndarray]:
+        return [process.cpdist(left, right, scorer=scorer, dtype=np.float32, workers=workers)
+                for scorer in (fuzz.ratio, fuzz.token_sort_ratio, fuzz.token_set_ratio)]
+
+    name_scores = scores(names1, names2)
+    addr_scores = scores(addrs1, addrs2)
+    result = np.empty((len(rows), len(FEATURES)), dtype=np.float32)
+    for i, row in enumerate(rows):
+        addr = tuple(float(values[i]) if has_both_addresses[i] else 0.0 for values in addr_scores)
+        fuzzy = tuple(float(values[i]) for values in name_scores) + addr
+        result[i] = pair_features(row[3], row[4], row[5], row[6], row[2], fuzzy)
+    return result
 
 
 def f05(true_count: np.ndarray, predicted_count: np.ndarray, true_positive: np.ndarray) -> np.ndarray:
