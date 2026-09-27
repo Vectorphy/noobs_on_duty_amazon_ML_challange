@@ -28,9 +28,10 @@ class V3MatchingCheck(unittest.TestCase):
 
     def test_feature_count(self) -> None:
         feats = pair_features("A", "10 Road", "A", "10 Road", 3)
-        self.assertEqual(len(feats), 23)
-        self.assertEqual(len(FEATURES), 23)
-        self.assertEqual(feats[-1], 1.0)   # street_number_match: both missing, fallback 0 -> wait, "10 Road" has leading 10
+        self.assertEqual(len(feats), 27)
+        self.assertEqual(len(FEATURES), 27)
+        self.assertEqual(feats[FEATURES.index("street_number_match")], 1.0)
+
 
     def test_street_number_match(self) -> None:
         self.assertEqual(street_number_match("105 Ribbon Ln", "11 Ribbon Ln"), -1.0)

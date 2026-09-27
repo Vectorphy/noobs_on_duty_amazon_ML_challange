@@ -38,3 +38,5 @@ scratch/
 .uv-cache/
 code/business_entity_resolution/artifacts/v2/work/
 code/business_entity_resolution/artifacts/v2/fixture/
+artifacts/
+**/artifacts/
