@@ -23,7 +23,11 @@ def safe_name(value: str) -> str:
 
 
 def model_artifacts(root: Path, model_name: str) -> Path:
-    return root if model_name == "lightgbm" else root / "models" / model_name
+    if model_name == "lightgbm":
+        return root
+    path = root / "models" / model_name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def make_model(model_name: str, memory_bounded: bool = False):
