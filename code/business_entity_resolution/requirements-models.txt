@@ -1,0 +1,5 @@
+# Optional estimators and TensorBoard event writing for the experimental v2 pipeline.
+xgboost==3.4.1
+catboost==1.2.10
+tensorboardX==2.6.5
+tensorboard==2.21.0

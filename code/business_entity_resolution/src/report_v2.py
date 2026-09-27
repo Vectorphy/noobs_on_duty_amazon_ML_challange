@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any
+from models_v2 import MODEL_NAMES, model_artifacts
 
 
 def number(value: Any, digits: int = 4) -> str:
@@ -47,7 +48,7 @@ def render_report(metrics: dict[str, Any]) -> str:
     threshold = dev.get("threshold")
 
     lines = [
-        "# V2 Full-Corpus Validation Report", "",
+        f"# V2 Full-Corpus Validation Report ({metrics.get('estimator', 'lightgbm')})", "",
         "## Run summary", "",
         f"- Random seed: {metrics.get('seed', '—')}",
         f"- Source 1 entities: {rows.get('s1', '—'):,}" if isinstance(rows.get("s1"), int) else f"- Source 1 entities: {rows.get('s1', '—')}",
@@ -92,13 +93,18 @@ def render_report(metrics: dict[str, Any]) -> str:
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--metrics", type=Path, default=root / "artifacts" / "v2" / "training_metrics.json")
-    parser.add_argument("--output", type=Path, default=root / "artifacts" / "v2" / "validation_report.md")
+    parser.add_argument("--model", choices=MODEL_NAMES, default="lightgbm")
+    parser.add_argument("--artifacts-dir", type=Path, default=root / "artifacts" / "v2")
+    parser.add_argument("--metrics", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    metrics = json.loads(args.metrics.read_text(encoding="utf-8"))
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(render_report(metrics), encoding="utf-8")
-    print(f"Wrote {args.output}")
+    artifacts = model_artifacts(args.artifacts_dir, args.model)
+    metrics_path = args.metrics or artifacts / "training_metrics.json"
+    output_path = args.output or artifacts / "validation_report.md"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(render_report(metrics), encoding="utf-8")
+    print(f"Wrote {output_path}")
 
 
 if __name__ == "__main__":

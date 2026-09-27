@@ -9,41 +9,31 @@ The existing submission model and inference script are never overwritten.
 from __future__ import annotations
 
 import argparse
-import ctypes
 import json
 import math
 import os
 import shutil
 import time
-import concurrent.futures
 from pathlib import Path
 
 import duckdb
 import joblib
 import numpy as np
-from lightgbm import LGBMClassifier
-
-try:
-    # gpu_connection wraps the vector-gpu-engine duckdb_gpu binary in
-    # --serve mode with IEEE FP64 enforcement (gpu_fast_math=false,
-    # gpu_precision_relaxation=false) and the GPU-resident column cache
-    # enabled (gpu_stream_pipeline=true). Falls back to plain duckdb when
-    # the binary is absent so the pipeline runs unmodified on CPU.
-    import gpu_connection as _gpu_connection
-    _HAS_GPU_CONNECTION = True
-except ImportError:
-    _HAS_GPU_CONNECTION = False
-
 from matching_v2 import (
-    ABLATION_GROUPS, BASE_FEATURES, FEATURES, KEY_S1_LIMITS,
+    ABLATION_GROUPS, BASE_FEATURES, FEATURES, FEATURE_ENGINE_VERSION, KEY_S1_LIMITS,
     KEY_TARGET_LIMIT, MAX_CANDIDATES_PER_SOURCE, block_keys, f05,
-    pair_features,
+    score_speedup,
+)
+from models_v2 import (
+    MODEL_NAMES, feature_importances, fit_model, make_model, model_artifacts,
+    positive_probability,
 )
 
 
 SEED = 42
 CAPS = (16, 24, 32)
 MAX_NEGATIVES = 6_000_000
+TRAIN_SELECTION_VERSION = "uniform-negative-ranks-1-32-v1"
 SELECT_PAIRS = 1_000_000
 BATCH = 20_000
 META_DTYPE = np.dtype([
@@ -61,26 +51,6 @@ def quoted(path: Path) -> str:
     return "'" + path.resolve().as_posix().replace("'", "''") + "'"
 
 
-def available_ram_gib() -> float:
-    if os.name != "nt":
-        return 0.0
-
-    class Status(ctypes.Structure):
-        _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
-            (name, ctypes.c_ulonglong) for name in (
-                "total_physical", "available_physical", "total_page",
-                "available_page", "total_virtual", "available_virtual",
-                "available_extended",
-            )
-        ]
-
-    status = Status()
-    status.length = ctypes.sizeof(status)
-    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-        raise OSError("Could not read available RAM")
-    return status.available_physical / 2**30
-
-
 def preflight(data_dir: Path, artifacts: Path) -> dict:
     paths = {name: data_dir / f"train_source{name[-1]}.tsv" for name in ("s1", "s2", "s3")}
     paths["ground_truth"] = data_dir / "train_ground_truth.tsv"
@@ -89,51 +59,23 @@ def preflight(data_dir: Path, artifacts: Path) -> dict:
         raise FileNotFoundError("Missing supplied training files: " + ", ".join(missing))
     artifacts.mkdir(parents=True, exist_ok=True)
     free_disk = shutil.disk_usage(artifacts).free / 2**30
-    free_ram = available_ram_gib()
     needed_disk = 5 if (artifacts/"work"/"pipeline.duckdb").exists() else 25
     if free_disk < needed_disk:
         raise RuntimeError(f"Need at least {needed_disk} GiB free for disk-backed work; found {free_disk:.1f} GiB")
-    if free_ram and free_ram < 3.5:
-        raise RuntimeError(f"Need at least 3.5 GiB available RAM; found {free_ram:.1f} GiB")
     return {
         "free_disk_gib_at_start": round(free_disk, 2),
-        "available_ram_gib_at_start": round(free_ram, 2),
+        "cpu_threads": os.cpu_count() or 1,
         "input_bytes": {name: path.stat().st_size for name, path in paths.items()},
     }
 
 
 def connect(work: Path) -> duckdb.DuckDBPyConnection:
-    """Open a DuckDB connection backed by the GPU engine when available.
-
-    When the vector-gpu-engine duckdb_gpu binary is present, returns a
-    HybridConnection that:
-      - Routes Python-UDF SQL (block_keys) to the duckdb-python CPU engine.
-      - Routes heavy relational SQL (candidate joins, Jaro-Winkler scoring)
-        to the duckdb_gpu subprocess with GPU offload.
-      - Enforces strict IEEE FP64 (gpu_fast_math=false,
-        gpu_precision_relaxation=false, no --use_fast_math in NVRTC).
-      - Enables the GPU-resident column cache (gpu_stream_pipeline=true) so
-        repeated candidate-join scans skip PCIe re-upload.
-
-    Falls back to a plain duckdb.connect() when the binary is absent.
-    """
     work.mkdir(parents=True, exist_ok=True)
-    spill = work / "spill"
-    db_path = work / "pipeline.duckdb"
-    if _HAS_GPU_CONNECTION:
-        con = _gpu_connection.connect(
-            db_path=db_path,
-            threads=4,
-            memory_limit="1536MB",
-            spill_dir=spill,
-            max_temp_directory_size="20GB",
-        )
-    else:
-        con = duckdb.connect(str(db_path))
-        con.execute("SET threads=4")
-        con.execute("SET memory_limit='1536MB'")
-        con.execute(f"SET temp_directory={quoted(spill)}")
-        con.execute("SET max_temp_directory_size='20GB'")
+    con = duckdb.connect(str(work / "pipeline.duckdb"))
+    con.execute(f"SET threads={os.cpu_count() or 1}")
+    con.execute("SET memory_limit='1536MB'")
+    con.execute(f"SET temp_directory={quoted(work / 'spill')}")
+    con.execute("SET max_temp_directory_size='20GB'")
     con.create_function("block_keys", block_keys, ["VARCHAR", "VARCHAR"], "VARCHAR[]")
     return con
 
@@ -149,6 +91,17 @@ def stage_done(con: duckdb.DuckDBPyConnection, name: str) -> bool:
 
 def mark_stage(con: duckdb.DuckDBPyConnection, name: str) -> None:
     con.execute("INSERT INTO pipeline_progress VALUES (?)",[name])
+
+
+def file_signature(paths: list[Path]) -> list[dict[str, int | str]]:
+    return [{"name": path.name, "size": path.stat().st_size,
+             "mtime_ns": path.stat().st_mtime_ns} for path in paths]
+
+
+def atomic_json(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def drop_tables(con: duckdb.DuckDBPyConnection, names: tuple[str, ...]) -> None:
@@ -299,39 +252,43 @@ def build_candidates(con: duckdb.DuckDBPyConnection, work: Path) -> dict:
     """)
     con.execute("CREATE TABLE IF NOT EXISTS candidate_parts (part INTEGER PRIMARY KEY)")
     done = {row[0] for row in con.execute("SELECT part FROM candidate_parts").fetchall()}
-    started = time.monotonic()
+    run_started = time.monotonic()
+    checkpoint_started = run_started
     for part in range(32):
         if part in done:
             continue
-        # DuckDB transactions cannot span across CPU/GPU engine hand-offs
-        # because the connection is closed. We make this idempotent instead.
-        con.execute(f"DELETE FROM candidates WHERE s1_ix % 32 = {part}")
-        con.execute(f"""
-        INSERT INTO candidates
-        WITH pairs AS (
-            SELECT DISTINCT sk.s1_ix, tk.target_ix
-            FROM s1_keys sk JOIN target_keys tk USING(country,key)
-            WHERE sk.s1_ix % 32 = {part}
-        ), scored AS (
-            SELECT p.s1_ix,p.target_ix,t.source_no,t.entity_id target_id,
-                   CAST(CASE WHEN s.business_address<>'' AND t.business_address<>''
-                       THEN 0.65*jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
-                          + 0.35*jaro_winkler_similarity(lower(s.business_address),lower(t.business_address))
-                       ELSE jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
-                   END AS REAL) rank_score
-            FROM pairs p JOIN s1 s ON p.s1_ix=s.ix
-                         JOIN targets t ON p.target_ix=t.ix
-        ), ranked AS (
-            SELECT *, row_number() OVER (
-                PARTITION BY s1_ix,source_no ORDER BY rank_score DESC,target_id
-            ) rank FROM scored
-        )
-        SELECT s1_ix,target_ix,source_no,CAST(rank AS TINYINT),rank_score
-        FROM ranked WHERE rank<={MAX_CANDIDATES_PER_SOURCE}
-        """)
-        con.execute("INSERT INTO candidate_parts VALUES (?)",[part])
+        con.execute("BEGIN TRANSACTION")
+        try:
+            con.execute(f"""
+            INSERT INTO candidates
+            WITH pairs AS (
+                SELECT DISTINCT sk.s1_ix, tk.target_ix
+                FROM s1_keys sk JOIN target_keys tk USING(country,key)
+                WHERE sk.s1_ix % 32 = {part}
+            ), scored AS (
+                SELECT p.s1_ix,p.target_ix,t.source_no,t.entity_id target_id,
+                       CAST(CASE WHEN s.business_address<>'' AND t.business_address<>''
+                           THEN 0.65*jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
+                              + 0.35*jaro_winkler_similarity(lower(s.business_address),lower(t.business_address))
+                           ELSE jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
+                       END AS REAL) rank_score
+                FROM pairs p JOIN s1 s ON p.s1_ix=s.ix
+                             JOIN targets t ON p.target_ix=t.ix
+            ), ranked AS (
+                SELECT *, row_number() OVER (
+                    PARTITION BY s1_ix,source_no ORDER BY rank_score DESC,target_id
+                ) rank FROM scored
+            )
+            SELECT s1_ix,target_ix,source_no,CAST(rank AS TINYINT),rank_score
+            FROM ranked WHERE rank<={MAX_CANDIDATES_PER_SOURCE}
+            """)
+            con.execute("INSERT INTO candidate_parts VALUES (?)",[part])
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
         if part == 0:
-            elapsed = time.monotonic() - started
+            elapsed = time.monotonic() - run_started
             log(f"First candidate partition: {count(con, 'candidates'):,} pairs in {elapsed:.1f}s; ~{elapsed*32/3600:.1f}h at this pace")
         elif (part + 1) % 4 == 0:
             log(f"Candidate partitions {part+1}/32, retained pairs {count(con, 'candidates'):,}")
@@ -356,12 +313,43 @@ def make_train_selection(con: duckdb.DuckDBPyConnection) -> dict:
         SELECT c.* FROM candidates c JOIN s1 s ON c.s1_ix=s.ix
         ANTI JOIN links l ON l.s1_ix=c.s1_ix AND l.target_ix=c.target_ix
         WHERE s.split=0
-        ORDER BY CASE WHEN c.rank<=4 THEN 0 ELSE 1 END,
-                 hash(c.s1_ix::VARCHAR || ':' || c.target_ix::VARCHAR || ':42')
+        ORDER BY hash(c.s1_ix::VARCHAR || ':' || c.target_ix::VARCHAR || ':42'),
+                 c.s1_ix,c.target_ix
         LIMIT {MAX_NEGATIVES}
     """)
     result = {"retrieved_train_positives": positives, "sampled_train_negatives": count(con, "train_selected")-positives}
+    ranks = con.execute("""
+        SELECT c.rank, count(*) FROM train_selected c ANTI JOIN links l
+          ON c.s1_ix=l.s1_ix AND c.target_ix=l.target_ix
+        GROUP BY c.rank ORDER BY c.rank
+    """).fetchall()
+    result["negative_pairs_by_rank"] = {str(rank): rows for rank, rows in ranks}
     log(f"Training pairs: {positives:,} positives, {result['sampled_train_negatives']:,} negatives")
+    log("Sampled negative pairs by candidate rank: " + json.dumps(result["negative_pairs_by_rank"], sort_keys=True))
+    return result
+
+
+def ensure_train_selection(con: duckdb.DuckDBPyConnection, work: Path) -> dict:
+    """Rebuild only the bounded pair sample when its sampling rule changes."""
+    marker = work / "train_selection_version.json"
+    previous = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else {}
+    if previous.get("version") != TRAIN_SELECTION_VERSION:
+        drop_tables(con, ("train_selected",))
+        con.execute("DELETE FROM pipeline_progress WHERE name='train_selection'")
+        for name in ("train_features.npy", "train_meta.npy", "train_complete.json", "train_progress.json"):
+            (work / name).unlink(missing_ok=True)
+        log(f"Invalidated old training sample/features (selection version {previous.get('version', 'unknown')})")
+    if not stage_done(con, "train_selection"):
+        result = make_train_selection(con)
+        mark_stage(con, "train_selection")
+    else:
+        selected = count(con, "train_selected")
+        positive = con.execute("""SELECT count(*) FROM train_selected c JOIN links l
+            ON c.s1_ix=l.s1_ix AND c.target_ix=l.target_ix""").fetchone()[0]
+        result = {"retrieved_train_positives": positive,
+                  "sampled_train_negatives": selected-positive}
+        log("Reusing versioned training-pair selection")
+    atomic_json(marker, {"version": TRAIN_SELECTION_VERSION, **result})
     return result
 
 
@@ -380,38 +368,87 @@ def pair_query(table: str, split: int | None = None, cap: int = 32) -> str:
 
 
 def extract_features(con: duckdb.DuckDBPyConnection, work: Path, name: str,
-                     table: str, split: int | None = None, cap: int = 32) -> tuple[np.memmap, np.memmap]:
+                     table: str, split: int | None = None, cap: int = 32,
+                     input_signature: list[dict] | None = None) -> tuple[np.memmap, np.memmap]:
     where = f" JOIN s1 s ON c.s1_ix=s.ix WHERE s.split={split} AND c.rank<={cap}" if split is not None else ""
     n = int(con.execute(f"SELECT count(*) FROM {table} c{where}").fetchone()[0])
     marker = work/f"{name}_complete.json"
     x_path = work/f"{name}_features.npy"
     meta_path = work/f"{name}_meta.npy"
+    signature = json.dumps({"rows": n, "cap": cap, "split": split,
+                            "feature_engine": FEATURE_ENGINE_VERSION,
+                            "features": FEATURES, "input_signature": input_signature},
+                           sort_keys=True)
     if marker.exists() and x_path.exists() and meta_path.exists():
         saved = json.loads(marker.read_text(encoding="utf-8"))
-        if saved == {"rows":n,"cap":cap,"split":split}:
+        if saved.get("signature") == signature and saved.get("complete"):
             log(f"Reusing completed {name} features: {n:,} rows")
             return np.load(x_path,mmap_mode="r"),np.load(meta_path,mmap_mode="r")
+        # Permit only the explicitly verified, frozen baseline development cache
+        # to migrate from its older marker format. Shape alone is not provenance;
+        # validation and training caches are rebuilt if they lack a full signature.
+        migration_path = work / "legacy_feature_cache_migration.json"
+        migration = (json.loads(migration_path.read_text(encoding="utf-8"))
+                     if migration_path.exists() else {})
+        approved = migration.get("verified_caches", {}).get(name, {})
+        if (name == "development" and
+                migration.get("input_signature") == input_signature and
+                migration.get("feature_names") == list(FEATURES) and
+                migration.get("verification", {}).get("baseline_development_macro_f05") is not None and
+                approved == {"rows": n, "cap": cap, "split": split} and
+                saved == {"rows": n, "cap": cap, "split": split} and
+                np.load(x_path, mmap_mode="r").shape == (n, len(FEATURES)) and
+                np.load(meta_path, mmap_mode="r").shape == (n,) and
+                np.load(meta_path, mmap_mode="r").dtype == META_DTYPE):
+            log(f"Reusing migrated, provenance-verified {name} cache: {n:,} rows")
+            return np.load(x_path, mmap_mode="r"), np.load(meta_path, mmap_mode="r")
     log(f"Extracting {name}: {n:,} candidate feature rows")
-    x = np.lib.format.open_memmap(x_path, mode="w+", dtype="float32", shape=(n, len(FEATURES)))
-    meta = np.lib.format.open_memmap(meta_path, mode="w+", dtype=META_DTYPE, shape=(n,))
-    cursor = con.execute(pair_query(table, split, cap))
+    progress_path = work/f"{name}_progress.json"
     offset = 0
-    def _process_row(row):
-        return pair_features(row[5], row[6], row[7], row[8], row[3]), (row[0], row[1], row[2], row[3], row[4])
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
-        while rows := cursor.fetchmany(BATCH):
-            for feat, met in executor.map(_process_row, rows):
-                x[offset] = feat
-                meta[offset] = met
-                offset += 1
-            if offset // 500_000 != (offset-len(rows)) // 500_000:
-                log(f"{name} features: {offset:,}/{n:,}")
+    if x_path.exists() and meta_path.exists() and progress_path.exists():
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        if progress.get("signature") == signature:
+            offset = min(n, int(progress.get("completed_rows", 0)))
+            log(f"Resuming {name} features at row {offset:,}/{n:,}")
+    mode = "r+" if offset else "w+"
+    x = np.lib.format.open_memmap(x_path, mode=mode, dtype="float32", shape=(n, len(FEATURES)))
+    meta = np.lib.format.open_memmap(meta_path, mode=mode, dtype=META_DTYPE, shape=(n,))
+    cursor = con.execute(pair_query(table, split, cap))
+    skip = offset
+    while skip:
+        skipped = cursor.fetchmany(min(BATCH, skip))
+        if not skipped:
+            raise ValueError(f"Could not resume {name}: saved offset exceeds query rows")
+        skip -= len(skipped)
+    run_started = time.monotonic()
+    checkpoint_started = run_started
+    last_checkpoint = offset
+    while rows := cursor.fetchmany(BATCH):
+        batch = np.asarray(rows, dtype=object)
+        stop = offset + len(rows)
+        x[offset:stop] = score_speedup(rows, layout="train")
+        for field, column in (("s1", 0), ("target", 1), ("rank", 2),
+                              ("source", 3), ("positive", 4)):
+            meta[field][offset:stop] = batch[:, column]
+        offset = stop
+        if offset - last_checkpoint >= 500_000 or offset == n:
+            x.flush()
+            meta.flush()
+            atomic_json(progress_path, {"signature": signature, "completed_rows": offset})
+            now = time.monotonic()
+            elapsed = max(now - checkpoint_started, 1e-6)
+            rate = (offset - last_checkpoint) / elapsed
+            total_rate = offset / max(now - run_started, 1e-6)
+            remaining = (n - offset) / max(total_rate, 1e-6)
+            log(f"{name} features {offset:,}/{n:,} ({offset/n:.1%}); "
+                f"{rate:,.0f} pairs/s; ETA {remaining/60:.1f} min")
+            last_checkpoint = offset
+            checkpoint_started = now
     if offset != n:
         raise ValueError(f"{name} query returned {offset} rows, expected {n}")
     x.flush()
     meta.flush()
-    marker.write_text(json.dumps({"rows":n,"cap":cap,"split":split}),encoding="utf-8")
+    atomic_json(marker, {"signature": signature, "complete": True, "completed_rows": n})
     return x, meta
 
 
@@ -438,33 +475,53 @@ def split_arrays(con: duckdb.DuckDBPyConnection, split: int) -> dict:
             "ix_to_local": ix_to_local}
 
 
-def model_for(columns: tuple[int, ...], memory_bounded: bool = False) -> LGBMClassifier:
-    return LGBMClassifier(
-        n_estimators=300, learning_rate=0.05,
-        num_leaves=15 if memory_bounded else 31,
-        min_child_samples=100, max_bin=31 if memory_bounded else 63,
-        n_jobs=1 if memory_bounded else 4, force_col_wise=memory_bounded,
-        random_state=SEED, importance_type="gain", verbosity=-1,
-    )
-
-
 def fit_sample(x: np.memmap, meta: np.memmap, cap: int,
-               columns: tuple[int, ...]) -> LGBMClassifier:
+               columns: tuple[int, ...], model_name: str,
+               checkpoint_dir: Path, tensorboard_dir: Path,
+               input_signature: list[dict], stage: str,
+               memory_bounded: bool = False):
     eligible = np.flatnonzero(meta["rank"] <= cap)
     rng = np.random.default_rng(SEED)
     if len(eligible) > SELECT_PAIRS:
         eligible = rng.choice(eligible, SELECT_PAIRS, replace=False)
-    model = model_for(columns)
-    model.fit(np.asarray(x[eligible][:, columns]), np.asarray(meta["positive"][eligible]))
-    return model
+    sample_x = np.asarray(x[eligible][:, columns])
+    sample_y = np.asarray(meta["positive"][eligible])
+    model, params = make_model(model_name, memory_bounded)
+    signature = {"model": model_name, "stage": stage, "params": params,
+                 "rows": len(sample_y), "columns": columns,
+                 "seed": SEED, "feature_engine": FEATURE_ENGINE_VERSION,
+                 "input_signature": input_signature}
+    return fit_model(model_name, model, sample_x, sample_y, stage=stage,
+                     checkpoint_dir=checkpoint_dir, signature=signature,
+                     tensorboard_dir=tensorboard_dir if model_name in {"lightgbm", "xgboost"} else None)
 
 
-def predict_memmap(model: LGBMClassifier, x: np.memmap,
+def fit_full(x, y, columns: tuple[int, ...], model_name: str,
+             checkpoint_dir: Path, tensorboard_dir: Path,
+             input_signature: list[dict], stage: str,
+             memory_bounded: bool = False):
+    model, params = make_model(model_name, memory_bounded)
+    signature = {"model": model_name, "stage": stage, "params": params,
+                 "rows": len(y), "columns": columns,
+                 "seed": SEED, "feature_engine": FEATURE_ENGINE_VERSION,
+                 "input_signature": input_signature}
+    return fit_model(model_name, model, x, y, stage=stage,
+                     checkpoint_dir=checkpoint_dir, signature=signature,
+                     tensorboard_dir=tensorboard_dir if model_name in {"lightgbm", "xgboost"} else None)
+
+
+def predict_memmap(model, x: np.memmap,
                    columns: tuple[int, ...], path: Path) -> np.memmap:
     prob = np.lib.format.open_memmap(path, mode="w+", dtype="float32", shape=(len(x),))
+    started = time.monotonic()
     for start in range(0, len(x), BATCH):
         stop = min(len(x), start+BATCH)
-        prob[start:stop] = model.predict_proba(np.asarray(x[start:stop][:, columns]))[:, 1]
+        prob[start:stop] = positive_probability(model, np.asarray(x[start:stop][:, columns]))
+        if stop == len(x) or stop // 500_000 != start // 500_000:
+            elapsed = max(time.monotonic() - started, 1e-6)
+            log(f"Prediction {stop:,}/{len(x):,} ({stop/len(x):.1%}); "
+                f"{(stop-start)/elapsed:,.0f} pairs/s")
+            started = time.monotonic()
     prob.flush()
     return prob
 
@@ -498,7 +555,7 @@ def score_grid(meta: np.memmap, prob: np.memmap, split: dict,
     return best[0], best[1], {"curve": curve, "predicted": predicted, "tp": tp}
 
 
-def evaluate_model(model: LGBMClassifier, x: np.memmap, meta: np.memmap,
+def evaluate_model(model, x: np.memmap, meta: np.memmap,
                    split: dict, caps: tuple[int, ...], columns: tuple[int, ...],
                    work: Path) -> dict:
     path = work / "current_prob.npy"
@@ -588,9 +645,39 @@ def final_slices(meta: np.memmap, prob: np.memmap, split: dict,
 
 
 def run(data: Path, artifacts: Path, frozen_baseline: bool = False,
-        memory_bounded: bool = False) -> None:
-    resources = preflight(data,artifacts)
-    work = artifacts / "work"
+        memory_bounded: bool = False, model_name: str = "lightgbm") -> None:
+    source_signature = file_signature([
+        data / name for name in ("train_source1.tsv", "train_source2.tsv",
+                                 "train_source3.tsv", "train_ground_truth.tsv")
+    ] + [Path(__file__).resolve(), Path(__file__).with_name("matching_v2.py")])
+    base_artifacts = artifacts
+    artifacts = model_artifacts(base_artifacts, model_name)
+    resources = preflight(data,base_artifacts)
+    # Corpus imports, candidates, splits, and extracted features are model independent.
+    # Reuse them across sequential model runs; keep estimator checkpoints isolated.
+    work = base_artifacts / "work"
+    checkpoint_dir = artifacts / "work" / "model_checkpoints"
+    tensorboard_dir = base_artifacts / "tensorboard" / model_name
+    work.mkdir(parents=True, exist_ok=True)
+    input_marker = work / "training_input_signature.json"
+    database_path = work / "pipeline.duckdb"
+    if input_marker.exists():
+        previous_signature = json.loads(input_marker.read_text(encoding="utf-8"))
+        if previous_signature != source_signature:
+            # A change isolated to training orchestration can preserve the costly
+            # immutable imports, blocks, and candidates. Selection has its own
+            # version marker and is rebuilt below. Data/matching changes still
+            # invalidate the database as before.
+            old_stable = [item for item in previous_signature if item.get("name") != "train_v2.py"]
+            new_stable = [item for item in source_signature if item["name"] != "train_v2.py"]
+            if old_stable != new_stable:
+                for path in (database_path, database_path.with_suffix(database_path.suffix + ".wal")):
+                    if path.exists():
+                        path.unlink()
+                log("Training inputs or matching features changed; invalidated DuckDB stage checkpoints")
+            else:
+                log("Training orchestration changed; preserving imported data and candidates")
+    atomic_json(input_marker, source_signature)
     con = connect(work)
     started = time.monotonic()
     try:
@@ -612,32 +699,31 @@ def run(data: Path, artifacts: Path, frozen_baseline: bool = False,
             keys = {"s1_keys":count(con,"s1_keys"),"target_keys":count(con,"target_keys")}
             log("Reusing completed blocking keys")
         candidates = build_candidates(con,work)
-        if not stage_done(con,"train_selection"):
-            drop_tables(con,("train_selected",))
-            training = make_train_selection(con)
-            mark_stage(con,"train_selection")
-        else:
-            selected = count(con,"train_selected")
-            positive = con.execute("""SELECT count(*) FROM train_selected c JOIN links l
-                ON c.s1_ix=l.s1_ix AND c.target_ix=l.target_ix""").fetchone()[0]
-            training = {"retrieved_train_positives":positive,"sampled_train_negatives":selected-positive}
-            log("Reusing completed training-pair selection")
+        training = ensure_train_selection(con, work)
         if not (artifacts/"split_assignments.parquet").exists():
             con.execute(f"COPY (SELECT entity_id,split FROM s1 ORDER BY ix) TO {quoted(artifacts/'split_assignments.parquet')} (FORMAT PARQUET)")
         base_cols = tuple(range(len(BASE_FEATURES)))
         all_cols = tuple(range(len(FEATURES)))
         cap = 24 if frozen_baseline else None
-        x_train, m_train = extract_features(con,work,"train","train_selected")
-        x_dev, m_dev = extract_features(con,work,"development","candidates",1,cap or 32)
+        x_train, m_train = extract_features(con,work,"train","train_selected",
+                                             input_signature=source_signature)
+        x_dev, m_dev = extract_features(con,work,"development","candidates",1,cap or 32,
+                                        input_signature=source_signature)
         dev = split_arrays(con,1)
         cache = {}
+
+        def sample_model(cap_value: int, columns: tuple[int, ...], stage: str):
+            return fit_sample(x_train,m_train,cap_value,columns,model_name,
+                              checkpoint_dir,tensorboard_dir,source_signature,stage,
+                              memory_bounded)
+
         if frozen_baseline:
             chosen = all_cols
             cap_scores = {"frozen_cap": 24, "development_score_at_selection": 0.84732}
             log("Resuming frozen baseline: 24 candidates per source and all 20 features")
         else:
             log("Selecting candidate cap on development data")
-            cap_model = fit_sample(x_train,m_train,32,base_cols)
+            cap_model = sample_model(32,base_cols,"candidate_cap")
             cap_scores = evaluate_model(cap_model,x_dev,m_dev,dev,CAPS,base_cols,work)
             best_cap_score = max(cap_scores[cap]["macro_f05"] for cap in CAPS)
             cap = next(cap for cap in CAPS if cap_scores[cap]["macro_f05"] >= best_cap_score-0.002)
@@ -645,7 +731,8 @@ def run(data: Path, artifacts: Path, frozen_baseline: bool = False,
 
             def assess(columns: tuple[int, ...]) -> dict:
                 if columns not in cache:
-                    model = fit_sample(x_train,m_train,cap,columns)
+                    stage = f"selection_cap{cap}_features{'_'.join(map(str,columns))}"
+                    model = sample_model(cap,columns,stage)
                     outcome = evaluate_model(model,x_dev,m_dev,dev,(cap,),columns,work)[cap]
                     cache[columns] = outcome
                     log(f"Feature set {len(columns)} columns: development F0.5={outcome['macro_f05']:.5f}")
@@ -683,8 +770,8 @@ def run(data: Path, artifacts: Path, frozen_baseline: bool = False,
             x_final[start:stop] = x_train[ix][:,chosen]
             y_final[start:stop] = m_train["positive"][ix]
         x_final.flush(); y_final.flush()
-        model = model_for(chosen,memory_bounded)
-        model.fit(x_final,y_final)
+        model = fit_full(x_final,y_final,chosen,model_name,checkpoint_dir,
+                         tensorboard_dir,source_signature,"final_model",memory_bounded)
         final_dev = evaluate_model(model,x_dev,m_dev,dev,(cap,),chosen,work)[cap]
         cache[chosen] = final_dev
         threshold = final_dev["threshold"]
@@ -697,13 +784,15 @@ def run(data: Path, artifacts: Path, frozen_baseline: bool = False,
                 stop = min(len(eligible),start+BATCH)
                 x_base[start:stop] = x_train[eligible[start:stop]][:,base_cols]
             x_base.flush()
-            baseline_model = model_for(base_cols,memory_bounded)
-            baseline_model.fit(x_base,y_final)
+            baseline_model = fit_full(x_base,y_final,base_cols,model_name,
+                                      checkpoint_dir,tensorboard_dir,source_signature,
+                                      "baseline_model",memory_bounded)
             full_baseline = evaluate_model(baseline_model,x_dev,m_dev,dev,(cap,),base_cols,work)[cap]
             del baseline_model,x_base
 
         log("Scoring untouched final-validation split once")
-        x_val,m_val = extract_features(con,work,"validation","candidates",2,cap)
+        x_val,m_val = extract_features(con,work,"validation","candidates",2,cap,
+                                       input_signature=source_signature)
         val = split_arrays(con,2)
         val_prob = predict_memmap(model,x_val,chosen,work/"validation_prob.npy")
         validation = final_slices(m_val,val_prob,val,cap,threshold)
@@ -712,7 +801,8 @@ def run(data: Path, artifacts: Path, frozen_baseline: bool = False,
             "validation": candidate_diagnostics(con,cap,2),
         }
         metrics = {
-            "seed": SEED, "rows": rows, "keys": keys, "candidates": candidates,
+            "seed": SEED, "estimator": model_name,
+            "rows": rows, "keys": keys, "candidates": candidates,
             "run_mode": "frozen_baseline" if frozen_baseline else "feature_selection",
             "model_variant": "memory_bounded" if memory_bounded else "standard",
             "training": training, "candidate_cap_grid": cap_scores,
@@ -727,13 +817,15 @@ def run(data: Path, artifacts: Path, frozen_baseline: bool = False,
             "final_development": final_dev,
             "candidate_diagnostics": diagnostics,
             "final_validation": validation,
-            "feature_gain": dict(zip((FEATURES[i] for i in chosen),map(float,model.feature_importances_))),
+            "feature_gain": dict(zip((FEATURES[i] for i in chosen),
+                                     map(float,feature_importances(model)))),
             "resources": {**resources,"elapsed_hours":round((time.monotonic()-started)/3600,3)},
         }
         joblib.dump(model,artifacts/"matcher_model.joblib")
         (artifacts/"model_config.json").write_text(json.dumps({
             "feature_names":metrics["selected_features"],
             "feature_indices":chosen,
+            "estimator":model_name,
             "candidate_cap_per_source":cap,
             "decision_threshold":threshold,
             "seed":SEED,
@@ -754,5 +846,7 @@ if __name__ == "__main__":
                         help="Resume completed checkpoints with fixed cap 24 and all 20 features; skip cap and feature selection.")
     parser.add_argument("--memory-bounded-model",action="store_true",
                         help="Use one training thread, 31 bins, and 15 leaves for low-memory full-data fitting.")
+    parser.add_argument("--model", choices=MODEL_NAMES, default="lightgbm",
+                        help="Estimator to train; non-LightGBM artifacts use separate model subfolders.")
     args = parser.parse_args()
-    run(args.train_dir,args.artifacts_dir,args.frozen_baseline,args.memory_bounded_model)
+    run(args.train_dir,args.artifacts_dir,args.frozen_baseline,args.memory_bounded_model,args.model)
