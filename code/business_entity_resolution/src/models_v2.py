@@ -106,13 +106,32 @@ def _writer(tensorboard_dir: Path | None, stage: str):
     if tensorboard_dir is None:
         return None
     try:
-        from tensorboardX import SummaryWriter
+        from tensorboard.compat.proto.event_pb2 import Event
+        from tensorboard.compat.proto.summary_pb2 import Summary
+        from tensorboard.summary.writer.event_file_writer import EventFileWriter
     except ImportError:
         raise ImportError(
-            "TensorBoard logging is enabled but tensorboardX is missing. "
+            "TensorBoard logging is enabled but tensorboard is missing. "
             "Install code/business_entity_resolution/requirements-models.txt."
         ) from None
-    return SummaryWriter(str(tensorboard_dir / safe_name(stage)), max_queue=10, flush_secs=5)
+
+    class ScalarWriter:
+        def __init__(self, logdir):
+            self.writer = EventFileWriter(str(logdir), max_queue_size=10, flush_secs=5)
+
+        def add_scalar(self, tag, value, step):
+            event = Event(wall_time=time.time(), step=int(step), summary=Summary(
+                value=[Summary.Value(tag=tag, simple_value=float(value))],
+            ))
+            self.writer.add_event(event)
+
+        def flush(self):
+            self.writer.flush()
+
+        def close(self):
+            self.writer.close()
+
+    return ScalarWriter(tensorboard_dir / safe_name(stage))
 
 
 def fit_model(model_name: str, model, x, y, *, stage: str,
