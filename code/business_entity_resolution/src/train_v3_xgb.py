@@ -1,0 +1,1019 @@
+"""Full-corpus, held-out v3 business entity resolution — XGBoost backend.
+
+Replaces the LightGBM classifier in train_v3 with XGBoost (xgboost.XGBClassifier).
+Every other pipeline stage (DuckDB ingestion, blocking, candidate generation,
+feature extraction, threshold search, validation reporting) is identical to train_v3.
+
+New / changed compared to train_v3
+------------------------------------
+* ``--device auto|cuda|cpu`` (default: auto).
+  - auto:  try CUDA; silently fall back to CPU with a log message.
+  - cuda:  require CUDA; raise RuntimeError before training if unavailable.
+  - cpu:   always CPU, useful for reproducibility checks.
+* LightGBM parameter mapping (documented in CHANGELOG and README):
+  LightGBM              → XGBoost
+  ─────────────────────────────────────────────
+  num_leaves            → max_leaves  (grow_policy="lossguide")
+  min_child_samples     → min_child_weight
+  max_bin               → max_bin
+  subsample             → subsample
+  subsample_freq        → (always 1 in xgb hist; implicit)
+  colsample_bytree      → colsample_bytree
+  lambda_l1             → reg_alpha
+  lambda_l2             → reg_lambda
+  n_estimators          → n_estimators
+  learning_rate         → learning_rate
+  importance_type="gain"→ importance_type="gain"  (same)
+  verbosity=-1          → verbosity=0
+
+Run from repository root:
+    python code/business_entity_resolution/src/train_v3_xgb.py \\
+        --train-dir student_resource/dataset/train \\
+        --artifacts-dir code/business_entity_resolution/artifacts/v3_xgb \\
+        --device auto
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import os
+import shutil
+import time
+from pathlib import Path
+
+import duckdb
+import joblib
+import numpy as np
+
+from matching_v3 import (
+    ABLATION_GROUPS, BASE_FEATURES, FEATURES, KEY_S1_LIMITS,
+    KEY_TARGET_LIMIT, MAX_CANDIDATES_PER_SOURCE, MAX_CANDIDATES_DEEP,
+    DEEP_CANDIDATE_THRESHOLD, SINGLETON_GUARD_THRESHOLD,
+    block_keys, f05, pair_features, score_speedup,
+)
+
+# ─── constants ────────────────────────────────────────────────────────────────
+SEED = 42
+CAPS = (16, 24, 32)
+MAX_NEGATIVES = 6_000_000
+SELECT_PAIRS = 1_000_000
+BATCH = 20_000
+META_DTYPE = np.dtype([
+    ("s1", "<i4"), ("target", "<i4"), ("rank", "u1"),
+    ("source", "u1"), ("positive", "u1"),
+])
+EXPECTED_ROWS = {"s1": 2_206_821, "s2": 5_034_616, "s3": 5_285_603}
+
+# XGBoost default parameters (LightGBM-equivalent)
+_XGB_BASE = dict(
+    n_estimators=800,
+    learning_rate=0.02,
+    # num_leaves=63 → max_leaves=63 with grow_policy="lossguide"
+    max_leaves=63,
+    grow_policy="lossguide",
+    # min_child_samples=50 → min_child_weight=50
+    # (XGBoost min_child_weight ≈ sum of instance weights, effectively
+    #  similar to LightGBM's min_child_samples for balanced datasets)
+    min_child_weight=50,
+    max_bin=127,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.0,
+    reg_lambda=1.0,
+    tree_method="hist",
+    random_state=SEED,
+    importance_type="gain",
+    verbosity=0,
+    eval_metric="logloss",
+    early_stopping_rounds=50,
+)
+_XGB_MEMORY_BOUNDED = dict(
+    max_leaves=15,
+    max_bin=31,
+)
+
+
+# ─── logging helpers ──────────────────────────────────────────────────────────
+def log(message: str) -> None:
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
+
+
+def quoted(path: Path) -> str:
+    return "'" + path.resolve().as_posix().replace("'", "''") + "'"
+
+
+# ─── GPU probe ────────────────────────────────────────────────────────────────
+def _probe_cuda() -> bool:
+    """Return True if XGBoost can see a CUDA device."""
+    try:
+        import xgboost as xgb
+        dm = xgb.DMatrix(np.zeros((2, 2), dtype=np.float32))
+        bst = xgb.train(
+            {"tree_method": "hist", "device": "cuda", "verbosity": 0,
+             "num_boost_round": 1},
+            dm, num_boost_round=1,
+        )
+        del bst
+        return True
+    except Exception:
+        return False
+
+
+def resolve_device(requested: str) -> str:
+    """Validate --device argument and return the actual device string."""
+    if requested == "cpu":
+        log("Device: CPU (forced by --device cpu)")
+        return "cpu"
+    if requested == "cuda":
+        log("Device: probing CUDA ...")
+        if not _probe_cuda():
+            raise RuntimeError(
+                "--device cuda requested but XGBoost cannot see a CUDA-capable GPU. "
+                "Install CUDA toolkit and xgboost[gpu], or use --device auto."
+            )
+        log("Device: CUDA confirmed")
+        return "cuda"
+    # auto
+    if _probe_cuda():
+        log("Device: CUDA detected (auto)")
+        return "cuda"
+    log("Device: CUDA unavailable — using CPU (auto)")
+    return "cpu"
+
+
+# ─── system preflight ─────────────────────────────────────────────────────────
+def available_ram_gib() -> float:
+    if os.name != "nt":
+        return 0.0
+
+    class Status(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
+            (name, ctypes.c_ulonglong) for name in (
+                "total_physical", "available_physical", "total_page",
+                "available_page", "total_virtual", "available_virtual",
+                "available_extended",
+            )
+        ]
+
+    status = Status()
+    status.length = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise OSError("Could not read available RAM")
+    return status.available_physical / 2**30
+
+
+def preflight(data_dir: Path, artifacts: Path) -> dict:
+    paths = {name: data_dir / f"train_source{name[-1]}.tsv" for name in ("s1", "s2", "s3")}
+    paths["ground_truth"] = data_dir / "train_ground_truth.tsv"
+    missing = [str(path) for path in paths.values() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Missing supplied training files: " + ", ".join(missing))
+    artifacts.mkdir(parents=True, exist_ok=True)
+    free_disk = shutil.disk_usage(artifacts).free / 2**30
+    free_ram = available_ram_gib()
+    needed_disk = 5 if (artifacts / "work" / "pipeline.duckdb").exists() else 25
+    if free_disk < needed_disk:
+        raise RuntimeError(f"Need at least {needed_disk} GiB free; found {free_disk:.1f} GiB")
+    if free_ram and free_ram < 3.5:
+        raise RuntimeError(f"Need at least 3.5 GiB available RAM; found {free_ram:.1f} GiB")
+    return {
+        "free_disk_gib_at_start": round(free_disk, 2),
+        "available_ram_gib_at_start": round(free_ram, 2),
+        "input_bytes": {name: path.stat().st_size for name, path in paths.items()},
+    }
+
+
+# ─── DuckDB helpers ───────────────────────────────────────────────────────────
+def connect(work: Path) -> duckdb.DuckDBPyConnection:
+    """Open a plain DuckDB connection. No GPU engine in v3."""
+    work.mkdir(parents=True, exist_ok=True)
+    spill = work / "spill"
+    db_path = work / "pipeline.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute("SET threads=4")
+    con.execute("SET memory_limit='1536MB'")
+    con.execute(f"SET temp_directory={quoted(spill)}")
+    con.execute("SET max_temp_directory_size='20GB'")
+    con.create_function("block_keys", block_keys, ["VARCHAR", "VARCHAR"], "VARCHAR[]")
+    return con
+
+
+def count(con: duckdb.DuckDBPyConnection, table: str) -> int:
+    return int(con.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+
+
+def stage_done(con: duckdb.DuckDBPyConnection, name: str) -> bool:
+    con.execute("CREATE TABLE IF NOT EXISTS pipeline_progress (name VARCHAR PRIMARY KEY)")
+    return bool(con.execute("SELECT count(*) FROM pipeline_progress WHERE name=?", [name]).fetchone()[0])
+
+
+def mark_stage(con: duckdb.DuckDBPyConnection, name: str) -> None:
+    con.execute("INSERT INTO pipeline_progress VALUES (?)", [name])
+
+
+def drop_tables(con: duckdb.DuckDBPyConnection, names: tuple[str, ...]) -> None:
+    for name in names:
+        con.execute(f"DROP TABLE IF EXISTS {name}")
+
+
+# ─── data ingestion ───────────────────────────────────────────────────────────
+def import_data(con: duckdb.DuckDBPyConnection, data: Path) -> dict:
+    log("Loading all training source rows")
+    s1 = quoted(data / "train_source1.tsv")
+    s2 = quoted(data / "train_source2.tsv")
+    s3 = quoted(data / "train_source3.tsv")
+    gt = quoted(data / "train_ground_truth.tsv")
+    csv = "delim='\\t', header=true, all_varchar=true, quote='', strict_mode=true"
+    con.execute(f"""
+        CREATE TABLE s1 AS
+        SELECT CAST(row_number() OVER (ORDER BY entity_id)-1 AS INTEGER) ix,
+               entity_id, coalesce(business_name,'') business_name,
+               coalesce(business_address,'') business_address, country,
+               CAST(0 AS SMALLINT) n_true, CAST(0 AS TINYINT) split
+        FROM read_csv({s1}, {csv})
+    """)
+    con.execute(f"""
+        CREATE TABLE targets AS
+        SELECT CAST(row_number() OVER ()-1 AS INTEGER) ix, entity_id,
+               coalesce(business_name,'') business_name,
+               coalesce(business_address,'') business_address, country, source_no
+        FROM (
+            SELECT *, CAST(2 AS TINYINT) source_no FROM read_csv({s2}, {csv})
+            UNION ALL
+            SELECT *, CAST(3 AS TINYINT) source_no FROM read_csv({s3}, {csv})
+        )
+    """)
+    con.execute(f"CREATE TABLE ground_truth AS SELECT * FROM read_csv({gt}, {csv})")
+    rows = {
+        "s1": count(con, "s1"),
+        "s2": int(con.execute("SELECT count(*) FROM targets WHERE source_no=2").fetchone()[0]),
+        "s3": int(con.execute("SELECT count(*) FROM targets WHERE source_no=3").fetchone()[0]),
+        "ground_truth": count(con, "ground_truth"),
+    }
+    if any(rows[name] != expected for name, expected in EXPECTED_ROWS.items()):
+        raise ValueError(f"Training source row counts disagree: {rows}")
+    if rows["ground_truth"] != rows["s1"]:
+        raise ValueError("Ground truth must contain one row per Source 1 entity")
+    con.execute("""
+        CREATE TABLE links_raw AS
+        SELECT s.ix s1_ix, trim(u.target_id) target_id
+        FROM ground_truth g JOIN s1 s ON g.source1_entity_id=s.entity_id,
+             UNNEST(string_split(coalesce(g.matched_entity_ids,''), ',')) u(target_id)
+        WHERE trim(u.target_id) <> ''
+    """)
+    con.execute("""
+        CREATE TABLE links AS
+        SELECT l.s1_ix, t.ix target_ix, t.source_no
+        FROM links_raw l JOIN targets t ON l.target_id=t.entity_id
+    """)
+    if count(con, "links") != count(con, "links_raw"):
+        raise ValueError("Ground truth contains unknown target IDs")
+    repeated = con.execute("""
+        SELECT count(*) FROM (
+            SELECT target_ix FROM links GROUP BY target_ix HAVING count(*)>1
+        )
+    """).fetchone()[0]
+    if repeated:
+        raise ValueError(f"{repeated} target IDs link to multiple S1 entities")
+    con.execute("""
+        UPDATE s1 SET n_true=x.n_true FROM (
+            SELECT s1_ix, CAST(count(*) AS SMALLINT) n_true FROM links GROUP BY s1_ix
+        ) x WHERE s1.ix=x.s1_ix
+    """)
+    con.execute("""
+        CREATE TEMP TABLE split_ranks AS
+        SELECT ix, row_number() OVER (
+            PARTITION BY country, CASE WHEN n_true=0 THEN 0 WHEN n_true=1 THEN 1 ELSE 2 END
+            ORDER BY hash(entity_id || '|42'), entity_id
+        ) rn, count(*) OVER (
+            PARTITION BY country, CASE WHEN n_true=0 THEN 0 WHEN n_true=1 THEN 1 ELSE 2 END
+        ) n
+        FROM s1
+    """)
+    con.execute("""
+        UPDATE s1 SET split=CASE
+            WHEN r.rn <= ceil(0.70*r.n) THEN 0
+            WHEN r.rn <= ceil(0.85*r.n) THEN 1 ELSE 2 END
+        FROM split_ranks r WHERE s1.ix=r.ix
+    """)
+    rows["positive_links"] = count(con, "links")
+    rows["split_rows"] = dict(con.execute(
+        "SELECT split,count(*) FROM s1 GROUP BY split ORDER BY split"
+    ).fetchall())
+    log(f"Loaded {rows['s1']:,} S1, {rows['s2']+rows['s3']:,} targets, {rows['positive_links']:,} links")
+    return rows
+
+
+# ─── blocking ─────────────────────────────────────────────────────────────────
+def build_keys(con: duckdb.DuckDBPyConnection) -> dict:
+    log("Building v3 blocking keys (n/t/a/w/p/z)")
+    con.execute("""
+        CREATE TABLE s1_keys_all AS
+        SELECT s.ix s1_ix, s.country, u.key
+        FROM s1 s, UNNEST(block_keys(s.business_name,s.business_address)) u(key)
+    """)
+    cases = " OR ".join(
+        f"(key LIKE '{prefix}:%' AND count(*)<={limit})"
+        for prefix, limit in KEY_S1_LIMITS.items()
+    )
+    con.execute(f"""
+        CREATE TABLE valid_keys AS
+        SELECT country,key FROM s1_keys_all GROUP BY country,key HAVING {cases}
+    """)
+    con.execute("""
+        CREATE TABLE s1_keys AS
+        SELECT a.* FROM s1_keys_all a JOIN valid_keys v USING(country,key)
+    """)
+    con.execute("DROP TABLE s1_keys_all")
+    con.execute("""
+        CREATE TABLE target_keys_all AS
+        SELECT t.ix target_ix, t.country, u.key
+        FROM targets t, UNNEST(block_keys(t.business_name,t.business_address)) u(key)
+        JOIN valid_keys v ON t.country=v.country AND u.key=v.key
+    """)
+    con.execute(f"""
+        CREATE TABLE target_keys AS
+        SELECT a.* FROM target_keys_all a JOIN (
+            SELECT country,key FROM target_keys_all GROUP BY country,key
+            HAVING count(*)<={KEY_TARGET_LIMIT}
+        ) v USING(country,key)
+    """)
+    con.execute("DROP TABLE target_keys_all")
+    result = {"s1_keys": count(con, "s1_keys"), "target_keys": count(con, "target_keys")}
+    log(f"Usable keys: S1={result['s1_keys']:,}, targets={result['target_keys']:,}")
+    return result
+
+
+# ─── candidate generation ──────────────────────────────────────────────────────
+def _score_sql(part_filter: str) -> str:
+    return f"""
+        WITH pairs AS (
+            SELECT DISTINCT sk.s1_ix, tk.target_ix
+            FROM s1_keys sk JOIN target_keys tk USING(country,key)
+            WHERE {part_filter}
+        ), scored AS (
+            SELECT p.s1_ix,p.target_ix,t.source_no,t.entity_id target_id,
+                   CAST(CASE WHEN s.business_address<>'' AND t.business_address<>''
+                       THEN 0.65*jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
+                          + 0.35*jaro_winkler_similarity(lower(s.business_address),lower(t.business_address))
+                       ELSE jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
+                   END AS REAL) rank_score
+            FROM pairs p JOIN s1 s ON p.s1_ix=s.ix
+                         JOIN targets t ON p.target_ix=t.ix
+        )
+        SELECT s1_ix,target_ix,source_no,target_id,rank_score FROM scored
+    """
+
+
+def build_candidates(con: duckdb.DuckDBPyConnection, work: Path) -> dict:
+    """Normal 32-per-source pass, then A3 adaptive depth extension to 48."""
+    log("Ranking blocked candidates (32 partitions, normal depth)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS candidates (
+            s1_ix INTEGER, target_ix INTEGER, source_no TINYINT,
+            rank TINYINT, rank_score REAL
+        )
+    """)
+    con.execute("CREATE TABLE IF NOT EXISTS candidate_parts (part INTEGER PRIMARY KEY)")
+    done = {row[0] for row in con.execute("SELECT part FROM candidate_parts").fetchall()}
+    started = time.monotonic()
+    for part in range(32):
+        if part in done:
+            continue
+        con.execute(f"DELETE FROM candidates WHERE s1_ix % 32 = {part}")
+        con.execute(f"""
+            INSERT INTO candidates
+            WITH base AS ({_score_sql(f"sk.s1_ix % 32 = {part}")}),
+            ranked AS (
+                SELECT *, row_number() OVER (
+                    PARTITION BY s1_ix,source_no ORDER BY rank_score DESC,target_id
+                ) rank FROM base
+            )
+            SELECT s1_ix,target_ix,source_no,CAST(rank AS TINYINT),rank_score
+            FROM ranked WHERE rank<={MAX_CANDIDATES_PER_SOURCE}
+        """)
+        con.execute("INSERT INTO candidate_parts VALUES (?)", [part])
+        if part == 0:
+            elapsed = time.monotonic() - started
+            log(f"First partition: {count(con, 'candidates'):,} pairs in {elapsed:.1f}s")
+        elif (part + 1) % 4 == 0:
+            log(f"Candidate partitions {part+1}/32, pairs {count(con,'candidates'):,}")
+            if shutil.disk_usage(work).free < 5 * 2**30:
+                raise RuntimeError("Less than 5 GiB disk remains")
+
+    log(f"A3: deep extension to rank {MAX_CANDIDATES_DEEP} for low-confidence slices")
+    con.execute(f"""
+        INSERT INTO candidates
+        WITH top_scores AS (
+            SELECT s1_ix, source_no, max(rank_score) top_score
+            FROM candidates GROUP BY s1_ix, source_no
+        ), ambiguous AS (
+            SELECT DISTINCT s1_ix FROM top_scores
+            WHERE top_score < {DEEP_CANDIDATE_THRESHOLD}
+        ), new_pairs AS (
+            SELECT DISTINCT sk.s1_ix, tk.target_ix
+            FROM s1_keys sk JOIN target_keys tk USING(country,key)
+            JOIN ambiguous a ON sk.s1_ix=a.s1_ix
+            WHERE NOT EXISTS (
+                SELECT 1 FROM candidates c
+                WHERE c.s1_ix=sk.s1_ix AND c.target_ix=tk.target_ix
+            )
+        ), scored AS (
+            SELECT p.s1_ix,p.target_ix,t.source_no,t.entity_id target_id,
+                   CAST(CASE WHEN s.business_address<>'' AND t.business_address<>''
+                       THEN 0.65*jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
+                          + 0.35*jaro_winkler_similarity(lower(s.business_address),lower(t.business_address))
+                       ELSE jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
+                   END AS REAL) rank_score
+            FROM new_pairs p JOIN s1 s ON p.s1_ix=s.ix
+                             JOIN targets t ON p.target_ix=t.ix
+        ), reranked AS (
+            SELECT *, {MAX_CANDIDATES_PER_SOURCE} + row_number() OVER (
+                PARTITION BY s1_ix,source_no ORDER BY rank_score DESC,target_id
+            ) rank FROM scored
+        )
+        SELECT s1_ix,target_ix,source_no,CAST(rank AS TINYINT),rank_score
+        FROM reranked WHERE rank<={MAX_CANDIDATES_DEEP}
+    """)
+    deep_extra = con.execute(
+        f"SELECT count(*) FROM candidates WHERE rank>{MAX_CANDIDATES_PER_SOURCE}"
+    ).fetchone()[0]
+    log(f"Adaptive depth added {deep_extra:,} extra pairs")
+    result = {"retained_pairs_at_cap": count(con, "candidates"), "deep_extra_pairs": deep_extra}
+    log(f"Candidate generation complete: {result['retained_pairs_at_cap']:,} pairs")
+    return result
+
+
+# ─── training-pair selection ───────────────────────────────────────────────────
+def make_train_selection(con: duckdb.DuckDBPyConnection, cap: int) -> dict:
+    log("Selecting all training positives and bounded hard negatives")
+    con.execute(f"""
+        CREATE TABLE train_selected AS
+        SELECT c.* FROM candidates c JOIN s1 s ON c.s1_ix=s.ix
+        JOIN links l ON l.s1_ix=c.s1_ix AND l.target_ix=c.target_ix
+        WHERE s.split=0 AND c.rank<={cap}
+    """)
+    positives = count(con, "train_selected")
+    con.execute(f"""
+        INSERT INTO train_selected
+        SELECT c.* FROM candidates c JOIN s1 s ON c.s1_ix=s.ix
+        ANTI JOIN links l ON l.s1_ix=c.s1_ix AND l.target_ix=c.target_ix
+        WHERE s.split=0 AND c.rank<={cap}
+        ORDER BY CASE WHEN c.rank<=4 THEN 0 ELSE 1 END,
+                 hash(c.s1_ix::VARCHAR || ':' || c.target_ix::VARCHAR || ':42')
+        LIMIT {MAX_NEGATIVES}
+    """)
+    result = {"retrieved_train_positives": positives,
+              "sampled_train_negatives": count(con, "train_selected") - positives}
+    log(f"Training pairs: {positives:,} positives, {result['sampled_train_negatives']:,} negatives")
+    return result
+
+
+# ─── feature extraction ────────────────────────────────────────────────────────
+def pair_query(table: str, split: int | None = None, cap: int = 32) -> str:
+    where = f"WHERE s.split={split} AND c.rank<={cap}" if split is not None else ""
+    return f"""
+        SELECT c.s1_ix,c.target_ix,c.rank,c.source_no,
+               CAST(l.target_ix IS NOT NULL AS TINYINT) positive,
+               s.business_name,s.business_address,t.business_name,t.business_address
+        FROM {table} c JOIN s1 s ON c.s1_ix=s.ix
+        JOIN targets t ON c.target_ix=t.ix
+        LEFT JOIN links l ON l.s1_ix=c.s1_ix AND l.target_ix=c.target_ix
+        {where}
+        ORDER BY c.s1_ix,c.target_ix
+    """
+
+
+def extract_features(con: duckdb.DuckDBPyConnection, work: Path, name: str,
+                     table: str, split: int | None = None,
+                     cap: int = 32) -> tuple[np.memmap, np.memmap]:
+    where = (f" JOIN s1 s ON c.s1_ix=s.ix WHERE s.split={split} AND c.rank<={cap}"
+             if split is not None else "")
+    n = int(con.execute(f"SELECT count(*) FROM {table} c{where}").fetchone()[0])
+    marker = work / f"{name}_complete.json"
+    x_path = work / f"{name}_features.npy"
+    meta_path = work / f"{name}_meta.npy"
+    if marker.exists() and x_path.exists() and meta_path.exists():
+        saved = json.loads(marker.read_text(encoding="utf-8"))
+        if saved == {"rows": n, "cap": cap, "split": split}:
+            log(f"Reusing completed {name} features: {n:,} rows")
+            return np.load(x_path, mmap_mode="r"), np.load(meta_path, mmap_mode="r")
+    log(f"Extracting {name}: {n:,} candidate feature rows")
+    x = np.lib.format.open_memmap(x_path, mode="w+", dtype="float32",
+                                   shape=(n, len(FEATURES)))
+    meta = np.lib.format.open_memmap(meta_path, mode="w+", dtype=META_DTYPE, shape=(n,))
+    cursor = con.execute(pair_query(table, split, cap))
+    offset = 0
+
+    while rows := cursor.fetchmany(BATCH):
+        batch = np.asarray(rows, dtype=object)
+        stop = offset + len(rows)
+        x[offset:stop] = score_speedup(rows, layout="train", workers=7)
+        for field, column in (("s1", 0), ("target", 1), ("rank", 2),
+                              ("source", 3), ("positive", 4)):
+            meta[field][offset:stop] = batch[:, column]
+        offset = stop
+        if offset // 500_000 != (offset - len(rows)) // 500_000:
+            log(f"{name} features: {offset:,}/{n:,}")
+    if offset != n:
+        raise ValueError(f"{name} query returned {offset} rows, expected {n}")
+    x.flush(); meta.flush()
+    marker.write_text(json.dumps({"rows": n, "cap": cap, "split": split}), encoding="utf-8")
+    return x, meta
+
+
+# ─── split helpers ─────────────────────────────────────────────────────────────
+def split_arrays(con: duckdb.DuckDBPyConnection, split: int) -> dict:
+    rows = con.execute(
+        "SELECT ix,n_true,country,business_address FROM s1 WHERE split=? ORDER BY ix",
+        [split]
+    ).fetchall()
+    if not rows:
+        raise ValueError(f"Empty split {split}")
+    ids = np.fromiter((r[0] for r in rows), dtype=np.int32, count=len(rows))
+    truth = np.fromiter((r[1] for r in rows), dtype=np.int16, count=len(rows))
+    countries = np.asarray([r[2] for r in rows])
+    missing_address = np.fromiter((not bool(r[3]) for r in rows), dtype=bool, count=len(rows))
+    ix_to_local = np.full(EXPECTED_ROWS["s1"], -1, dtype=np.int32)
+    ix_to_local[ids] = np.arange(len(ids), dtype=np.int32)
+    linked_to_missing = np.zeros(len(ids), dtype=bool)
+    for (ix,) in con.execute("""
+        SELECT DISTINCT l.s1_ix FROM links l JOIN s1 s ON l.s1_ix=s.ix
+        JOIN targets t ON l.target_ix=t.ix
+        WHERE s.split=? AND t.business_address=''
+    """, [split]).fetchall():
+        linked_to_missing[ix_to_local[ix]] = True
+    return {"ix": ids, "truth": truth, "country": countries,
+            "missing_address": missing_address,
+            "linked_to_missing_address": linked_to_missing,
+            "ix_to_local": ix_to_local}
+
+
+# ─── model factory ─────────────────────────────────────────────────────────────
+def model_for(columns: tuple[int, ...], device: str = "cpu",
+              memory_bounded: bool = False):
+    """Return a configured XGBClassifier."""
+    from xgboost import XGBClassifier
+    params = dict(_XGB_BASE)
+    if memory_bounded:
+        params.update(_XGB_MEMORY_BOUNDED)
+        params["n_jobs"] = 1
+    else:
+        params["n_jobs"] = 7          # matches the 7-thread CPU target
+    params["device"] = device
+    # GPU reproducibility: XGBoost hist on GPU is non-deterministic by default;
+    # we pin the random seed and disable GPU-side randomisation where possible.
+    if device == "cuda":
+        params["seed_per_iteration"] = False
+    return XGBClassifier(**params)
+
+
+# ─── fitting helpers ───────────────────────────────────────────────────────────
+def fit_sample(x: np.memmap, meta: np.memmap, cap: int,
+               columns: tuple[int, ...], device: str = "cpu"):
+    eligible = np.flatnonzero(meta["rank"] <= cap)
+    rng = np.random.default_rng(SEED)
+    if len(eligible) > SELECT_PAIRS:
+        eligible = rng.choice(eligible, SELECT_PAIRS, replace=False)
+    model = model_for(columns, device)
+    x_sel = np.asarray(x[eligible][:, columns])
+    y_sel = np.asarray(meta["positive"][eligible])
+    # Use a small monitor set for early stopping on ablation fits
+    split_idx = max(1, int(0.9 * len(x_sel)))
+    model.fit(
+        x_sel[:split_idx], y_sel[:split_idx],
+        eval_set=[(x_sel[split_idx:], y_sel[split_idx:])],
+        verbose=False,
+    )
+    return model
+
+
+def predict_memmap(model, x: np.memmap,
+                   columns: tuple[int, ...], path: Path) -> np.memmap:
+    prob = np.lib.format.open_memmap(path, mode="w+", dtype="float32", shape=(len(x),))
+    for start in range(0, len(x), BATCH):
+        stop = min(len(x), start + BATCH)
+        prob[start:stop] = model.predict_proba(np.asarray(x[start:stop][:, columns]))[:, 1]
+    prob.flush()
+    return prob
+
+
+# ─── threshold search ─────────────────────────────────────────────────────────
+def score_grid(meta: np.memmap, prob: np.memmap, split: dict,
+               cap: int) -> tuple[float, float, dict]:
+    n = len(split["truth"])
+    total = np.zeros((n, 101), dtype=np.int32)
+    true_arr = np.zeros((n, 101), dtype=np.int32)
+    for start in range(0, len(meta), BATCH):
+        stop = min(len(meta), start + BATCH)
+        piece = meta[start:stop]
+        use = piece["rank"] <= cap
+        local = split["ix_to_local"][piece["s1"][use]]
+        bins = np.minimum(100, (prob[start:stop][use] * 100).astype(np.int16))
+        np.add.at(total, (local, bins), 1)
+        is_true = piece["positive"][use] == 1
+        np.add.at(true_arr, (local[is_true], bins[is_true]), 1)
+    predicted = np.zeros(n, dtype=np.int32)
+    tp = np.zeros(n, dtype=np.int32)
+    best = (-1.0, -1.0)
+    curve = []
+    for step in range(100, -1, -1):
+        predicted += total[:, step]
+        tp += true_arr[:, step]
+        score = float(f05(split["truth"], predicted, tp).mean())
+        threshold = step / 100
+        curve.append({"threshold": threshold, "macro_f05": score})
+        if (score, threshold) > best:
+            best = (score, threshold)
+    return best[0], best[1], {"curve": curve, "predicted": predicted, "tp": tp}
+
+
+def score_grid_per_country(meta: np.memmap, prob: np.memmap, split: dict,
+                            cap: int) -> dict[str, dict]:
+    """C1: find the best threshold per country on the development split."""
+    result: dict[str, dict] = {}
+    for country in np.unique(split["country"]):
+        mask = split["country"] == country
+        local_ids = np.where(mask)[0]
+        if not local_ids.size:
+            continue
+        s1_set = set(int(v) for v in split["ix"][local_ids])
+        n = len(local_ids)
+        sub_ix_map = {int(v): i for i, v in enumerate(split["ix"][local_ids])}
+        total = np.zeros((n, 101), dtype=np.int32)
+        true_arr = np.zeros((n, 101), dtype=np.int32)
+        for start in range(0, len(meta), BATCH):
+            stop = min(len(meta), start + BATCH)
+            piece = meta[start:stop]
+            use = piece["rank"] <= cap
+            s1_v = piece["s1"][use]
+            in_c = np.array([v in s1_set for v in s1_v], dtype=bool)
+            if not in_c.any():
+                continue
+            s1_c = s1_v[in_c]
+            p_c = prob[start:stop][use][in_c]
+            pos_c = piece["positive"][use][in_c]
+            bins = np.minimum(100, (p_c * 100).astype(np.int16))
+            local = np.fromiter((sub_ix_map[v] for v in s1_c), dtype=np.int32, count=len(s1_c))
+            np.add.at(total, (local, bins), 1)
+            np.add.at(true_arr, (local[pos_c == 1], bins[pos_c == 1]), 1)
+        truth_sub = split["truth"][local_ids]
+        predicted = np.zeros(n, dtype=np.int32)
+        tp = np.zeros(n, dtype=np.int32)
+        best = (-1.0, -1.0)
+        for step in range(100, -1, -1):
+            predicted += total[:, step]
+            tp += true_arr[:, step]
+            score = float(f05(truth_sub, predicted, tp).mean())
+            if (score, step / 100) > best:
+                best = (score, step / 100)
+        result[country] = {"threshold": best[1], "macro_f05": best[0], "n": n}
+    return result
+
+
+def evaluate_model(model, x: np.memmap, meta: np.memmap,
+                   split: dict, caps: tuple[int, ...], columns: tuple[int, ...],
+                   work: Path) -> dict:
+    path = work / "current_prob.npy"
+    prob = predict_memmap(model, x, columns, path)
+    result = {}
+    for cap in caps:
+        score, threshold, detail = score_grid(meta, prob, split, cap)
+        result[cap] = {"macro_f05": score, "threshold": threshold,
+                       "threshold_curve": detail["curve"]}
+    del prob
+    return result
+
+
+# ─── candidate diagnostics ────────────────────────────────────────────────────
+def candidate_diagnostics(con: duckdb.DuckDBPyConnection, cap: int, split: int) -> dict:
+    raw = con.execute("""
+        SELECT l.source_no, count(*) links, count(c.target_ix) retrieved
+        FROM links l JOIN s1 s ON l.s1_ix=s.ix
+        LEFT JOIN candidates c ON c.s1_ix=l.s1_ix AND c.target_ix=l.target_ix AND c.rank<=?
+        WHERE s.split=? GROUP BY l.source_no ORDER BY l.source_no
+    """, [cap, split]).fetchall()
+    by_source = {str(src): {"links": n, "retrieved": hit, "recall": hit / n if n else 0.0}
+                 for src, n, hit in raw}
+    recovered = np.zeros(EXPECTED_ROWS["s1"], dtype=np.int16)
+    for ix, hits in con.execute("""
+        SELECT l.s1_ix,count(*) FROM links l JOIN s1 s ON l.s1_ix=s.ix
+        JOIN candidates c ON c.s1_ix=l.s1_ix AND c.target_ix=l.target_ix AND c.rank<=?
+        WHERE s.split=? GROUP BY l.s1_ix
+    """, [cap, split]).fetchall():
+        recovered[ix] = hits
+    rows = con.execute("SELECT ix,n_true FROM s1 WHERE split=?", [split]).fetchall()
+    ix = np.fromiter((r[0] for r in rows), dtype=np.int32, count=len(rows))
+    truth = np.fromiter((r[1] for r in rows), dtype=np.int16, count=len(rows))
+    hit = recovered[ix]
+    oracle = f05(truth, hit, hit)
+    nc = con.execute("""
+        SELECT count(*),count(DISTINCT c.s1_ix)
+        FROM candidates c JOIN s1 s ON c.s1_ix=s.ix WHERE s.split=? AND c.rank<=?
+    """, [split, cap]).fetchone()
+    return {
+        "by_source": by_source,
+        "all_true_links_retained_fraction": float(np.mean(hit == truth)),
+        "oracle_macro_f05": float(oracle.mean()),
+        "entities_without_candidates": len(rows) - nc[1],
+        "candidate_pairs": nc[0],
+        "mean_candidates_per_s1": nc[0] / len(rows),
+    }
+
+
+# ─── final evaluation slices ──────────────────────────────────────────────────
+def final_slices(meta: np.memmap, prob: np.memmap, split: dict,
+                 cap: int, threshold: float,
+                 singleton_guard: float = 0.0) -> dict:
+    """Score dev/val split at (threshold, singleton_guard)."""
+    n = len(split["truth"])
+    max_prob = np.zeros(n, dtype=np.float32)
+    predicted = np.zeros(n, dtype=np.int32)
+    tp = np.zeros(n, dtype=np.int32)
+    for start in range(0, len(meta), BATCH):
+        stop = min(len(meta), start + BATCH)
+        piece = meta[start:stop]
+        use_rank = piece["rank"] <= cap
+        local_all = split["ix_to_local"][piece["s1"][use_rank]]
+        p_all = prob[start:stop][use_rank]
+        np.maximum.at(max_prob, local_all, p_all)
+        above = p_all >= threshold
+        if above.any():
+            local_above = local_all[above]
+            np.add.at(predicted, local_above, 1)
+            np.add.at(tp, local_above, piece["positive"][use_rank][above])
+    if singleton_guard > 0.0:
+        guarded = max_prob < singleton_guard
+        predicted = np.where(guarded, 0, predicted)
+        tp = np.where(guarded, 0, tp)
+    scores = f05(split["truth"], predicted, tp)
+    groups = {
+        "country": {v: split["country"] == v for v in np.unique(split["country"])},
+        "degree": {"singleton": split["truth"] == 0, "one": split["truth"] == 1,
+                   "multiple": split["truth"] >= 2},
+        "address_availability": {
+            "source1_missing": split["missing_address"],
+            "linked_target_missing": split["linked_to_missing_address"],
+            "both_present_or_singleton": ~(split["missing_address"] | split["linked_to_missing_address"]),
+        },
+    }
+    slices = {
+        family: {name: {"entities": int(mask.sum()),
+                         "macro_f05": float(scores[mask].mean()) if mask.any() else None}
+                 for name, mask in values.items()}
+        for family, values in groups.items()
+    }
+    return {
+        "macro_f05": float(scores.mean()),
+        "pair_precision": float(tp.sum() / predicted.sum()) if predicted.sum() else 0.0,
+        "pair_recall": float(tp.sum() / split["truth"].sum()) if split["truth"].sum() else 0.0,
+        "slices": slices,
+    }
+
+
+def find_singleton_guard_threshold(
+    meta: np.memmap, prob: np.memmap, split: dict, cap: int, match_threshold: float
+) -> tuple[float, float]:
+    """C3: grid-search the singleton guard threshold on the development split."""
+    n = len(split["truth"])
+    max_prob = np.zeros(n, dtype=np.float32)
+    predicted_base = np.zeros(n, dtype=np.int32)
+    tp_base = np.zeros(n, dtype=np.int32)
+    for start in range(0, len(meta), BATCH):
+        stop = min(len(meta), start + BATCH)
+        piece = meta[start:stop]
+        use = piece["rank"] <= cap
+        local = split["ix_to_local"][piece["s1"][use]]
+        p = prob[start:stop][use]
+        np.maximum.at(max_prob, local, p)
+        above = p >= match_threshold
+        if above.any():
+            local_above = local[above]
+            np.add.at(predicted_base, local_above, 1)
+            np.add.at(tp_base, local_above, piece["positive"][use][above])
+    best_score = float(f05(split["truth"], predicted_base, tp_base).mean())
+    best_guard = 0.0
+    for step in range(5, 71, 5):
+        guard = step / 100.0
+        guarded = max_prob < guard
+        pred = np.where(guarded, 0, predicted_base)
+        tp = np.where(guarded, 0, tp_base)
+        score = float(f05(split["truth"], pred, tp).mean())
+        if score > best_score:
+            best_score = score
+            best_guard = guard
+    log(f"C3 singleton guard: threshold={best_guard:.2f}, dev F0.5={best_score:.5f}")
+    return best_guard, best_score
+
+
+# ─── main pipeline ─────────────────────────────────────────────────────────────
+def run(data: Path, artifacts: Path, device: str = "cpu",
+        memory_bounded: bool = False) -> None:
+    resources = preflight(data, artifacts)
+    work = artifacts / "work"
+    con = connect(work)
+    started = time.monotonic()
+    try:
+        if not stage_done(con, "import"):
+            drop_tables(con, ("links", "links_raw", "ground_truth", "targets", "s1"))
+            rows = import_data(con, data)
+            mark_stage(con, "import")
+        else:
+            rows = {
+                "s1": count(con, "s1"),
+                "s2": con.execute("SELECT count(*) FROM targets WHERE source_no=2").fetchone()[0],
+                "s3": con.execute("SELECT count(*) FROM targets WHERE source_no=3").fetchone()[0],
+                "ground_truth": count(con, "ground_truth"),
+                "positive_links": count(con, "links"),
+                "split_rows": dict(con.execute("SELECT split,count(*) FROM s1 GROUP BY split ORDER BY split").fetchall()),
+            }
+            log("Reusing completed full-data import and frozen split")
+
+        if not stage_done(con, "keys"):
+            drop_tables(con, ("target_keys", "target_keys_all", "s1_keys", "valid_keys", "s1_keys_all"))
+            keys = build_keys(con)
+            mark_stage(con, "keys")
+        else:
+            keys = {"s1_keys": count(con, "s1_keys"), "target_keys": count(con, "target_keys")}
+            log("Reusing completed blocking keys")
+
+        candidates = build_candidates(con, work)
+
+        if not stage_done(con, "train_selection"):
+            drop_tables(con, ("train_selected",))
+            training = make_train_selection(con, MAX_CANDIDATES_PER_SOURCE)
+            mark_stage(con, "train_selection")
+        else:
+            selected = count(con, "train_selected")
+            positive = con.execute("""SELECT count(*) FROM train_selected c JOIN links l
+                ON c.s1_ix=l.s1_ix AND c.target_ix=l.target_ix""").fetchone()[0]
+            training = {"retrieved_train_positives": positive,
+                        "sampled_train_negatives": selected - positive}
+            log("Reusing completed training-pair selection")
+
+        if not (artifacts / "split_assignments.parquet").exists():
+            con.execute(
+                f"COPY (SELECT entity_id,split FROM s1 ORDER BY ix) "
+                f"TO {quoted(artifacts/'split_assignments.parquet')} (FORMAT PARQUET)"
+            )
+
+        base_cols = tuple(range(len(BASE_FEATURES)))
+        all_cols = tuple(range(len(FEATURES)))
+        cap = MAX_CANDIDATES_PER_SOURCE
+
+        x_train, m_train = extract_features(con, work, "train", "train_selected")
+        x_dev, m_dev = extract_features(con, work, "development", "candidates", 1, MAX_CANDIDATES_DEEP)
+        dev = split_arrays(con, 1)
+        cache: dict = {}
+
+        def assess(columns: tuple[int, ...]) -> dict:
+            if columns not in cache:
+                model = fit_sample(x_train, m_train, cap, columns, device)
+                outcome = evaluate_model(model, x_dev, m_dev, dev, (cap,), columns, work)[cap]
+                cache[columns] = outcome
+                log(f"Feature set {len(columns)} cols: development F0.5={outcome['macro_f05']:.5f}")
+            return cache[columns]
+
+        log("Running grouped feature ablations")
+        baseline = assess(base_cols)
+        chosen = all_cols
+        assess(chosen)
+        while True:
+            options = [chosen]
+            for group in ABLATION_GROUPS.values():
+                reduced = tuple(i for i in chosen if i not in group)
+                if reduced and reduced != chosen:
+                    options.append(reduced)
+            for columns in options:
+                assess(columns)
+            top = max(cache[columns]["macro_f05"] for columns in options)
+            eligible = [c for c in options if cache[c]["macro_f05"] >= top - 0.002]
+            next_choice = min(eligible, key=lambda c: (len(c), c))
+            if next_choice == chosen:
+                break
+            chosen = next_choice
+        if baseline["macro_f05"] >= cache[chosen]["macro_f05"] - 0.002 and len(base_cols) < len(chosen):
+            chosen = base_cols
+        log(f"Selected {len(chosen)} features: {[FEATURES[i] for i in chosen]}")
+
+        log("Fitting final XGBoost model on all training pairs")
+        eligible_idx = np.flatnonzero(m_train["rank"] <= cap)
+        x_final = np.lib.format.open_memmap(
+            work / "final_train.npy", mode="w+", dtype="float32",
+            shape=(len(eligible_idx), len(chosen))
+        )
+        y_final = np.lib.format.open_memmap(
+            work / "final_labels.npy", mode="w+", dtype="u1", shape=(len(eligible_idx),)
+        )
+        for start in range(0, len(eligible_idx), BATCH):
+            stop = min(len(eligible_idx), start + BATCH)
+            ix = eligible_idx[start:stop]
+            x_final[start:stop] = x_train[ix][:, chosen]
+            y_final[start:stop] = m_train["positive"][ix]
+        x_final.flush(); y_final.flush()
+
+        model = model_for(chosen, device, memory_bounded)
+        # Final model: train on 90% and use remaining 10% for early stopping
+        n_final = len(x_final)
+        split_point = int(0.9 * n_final)
+        model.fit(
+            np.asarray(x_final[:split_point]), np.asarray(y_final[:split_point]),
+            eval_set=[(np.asarray(x_final[split_point:]), np.asarray(y_final[split_point:]))],
+            verbose=25,
+        )
+        final_dev = evaluate_model(model, x_dev, m_dev, dev, (cap,), chosen, work)[cap]
+        threshold = final_dev["threshold"]
+
+        log("C1: computing per-country thresholds on development split")
+        dev_prob = predict_memmap(model, x_dev, chosen, work / "dev_prob_final.npy")
+        country_thresholds = score_grid_per_country(m_dev, dev_prob, dev, cap)
+
+        log("C3: searching singleton guard threshold on development split")
+        singleton_guard, sg_dev_f05 = find_singleton_guard_threshold(
+            m_dev, dev_prob, dev, cap, threshold
+        )
+        del dev_prob
+
+        log("Scoring untouched final-validation split once")
+        x_val, m_val = extract_features(con, work, "validation", "candidates", 2, cap)
+        val = split_arrays(con, 2)
+        val_prob = predict_memmap(model, x_val, chosen, work / "validation_prob.npy")
+        validation = final_slices(m_val, val_prob, val, cap, threshold, singleton_guard)
+        diagnostics = {
+            "development": candidate_diagnostics(con, cap, 1),
+            "validation": candidate_diagnostics(con, cap, 2),
+        }
+        metrics = {
+            "seed": SEED, "rows": rows, "keys": keys, "candidates": candidates,
+            "run_mode": "v3_xgb_feature_selection",
+            "model_backend": "xgboost",
+            "device_used": device,
+            "model_variant": "memory_bounded" if memory_bounded else "standard",
+            "training": training,
+            "selected_cap_per_source": cap,
+            "deep_cap_per_source": MAX_CANDIDATES_DEEP,
+            "deep_candidate_threshold": DEEP_CANDIDATE_THRESHOLD,
+            "baseline_15_features": {
+                "development_macro_f05": baseline["macro_f05"],
+                "development_threshold": baseline["threshold"],
+                "same_training_pairs": True,
+            },
+            "feature_selection": {
+                ",".join(map(str, k)): {
+                    "features": [FEATURES[i] for i in k],
+                    "development_macro_f05": v["macro_f05"],
+                    "threshold": v["threshold"],
+                }
+                for k, v in cache.items()
+            },
+            "selected_features": [FEATURES[i] for i in chosen],
+            "final_development": final_dev,
+            "country_thresholds": country_thresholds,
+            "candidate_diagnostics": diagnostics,
+            "final_validation": validation,
+            "feature_gain": dict(zip(
+                (FEATURES[i] for i in chosen),
+                map(float, model.feature_importances_),
+            )),
+            "resources": {**resources, "elapsed_hours": round((time.monotonic() - started) / 3600, 3)},
+        }
+        joblib.dump(model, artifacts / "matcher_model.joblib")
+        (artifacts / "model_config.json").write_text(json.dumps({
+            "feature_names": metrics["selected_features"],
+            "feature_indices": list(chosen),
+            "candidate_cap_per_source": cap,
+            "deep_cap_per_source": MAX_CANDIDATES_DEEP,
+            "deep_candidate_threshold": DEEP_CANDIDATE_THRESHOLD,
+            "decision_threshold": threshold,
+            "singleton_guard_threshold": singleton_guard,
+            "country_thresholds": {k: v["threshold"] for k, v in country_thresholds.items()},
+            "mutual_exclusivity_suppression": True,
+            "seed": SEED,
+            "model_backend": "xgboost",
+            "device_used": device,
+            "model_variant": "memory_bounded" if memory_bounded else "standard",
+        }, indent=2), encoding="utf-8")
+        (artifacts / "training_metrics.json").write_text(
+            json.dumps(metrics, indent=2), encoding="utf-8"
+        )
+        log(f"Final validation macro F0.5={validation['macro_f05']:.6f}; artifacts: {artifacts}")
+    finally:
+        con.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    root = Path(__file__).resolve().parents[3]
+    parser.add_argument("--train-dir", type=Path,
+                        default=root / "student_resource" / "dataset" / "train")
+    parser.add_argument("--artifacts-dir", type=Path,
+                        default=root / "code" / "business_entity_resolution" / "artifacts" / "v3_xgb")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto",
+                        help="XGBoost compute device. 'auto' tries CUDA then falls back to CPU.")
+    parser.add_argument("--memory-bounded-model", action="store_true",
+                        help="Use 1 thread, 31 bins, 15 leaves for low-memory fitting.")
+    args = parser.parse_args()
+    actual_device = resolve_device(args.device)
+    run(args.train_dir, args.artifacts_dir, actual_device, args.memory_bounded_model)
