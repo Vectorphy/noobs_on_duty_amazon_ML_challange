@@ -47,9 +47,13 @@ def make_model(model_name: str, memory_bounded: bool = False):
             from xgboost import XGBClassifier
         except ImportError as exc:
             raise ImportError("Install requirements-models.txt to use XGBoost") from exc
+        device = os.environ.get("XGBOOST_DEVICE", "cpu").lower()
+        if device not in {"cpu", "cuda"}:
+            raise ValueError("XGBOOST_DEVICE must be 'cpu' or 'cuda'")
         params = dict(n_estimators=TREE_COUNT, learning_rate=0.05,
                       max_depth=8, min_child_weight=100, max_bin=bins,
-                      tree_method="hist", n_jobs=threads, random_state=42,
+                      tree_method="hist", device=device,
+                      n_jobs=threads, random_state=42,
                       eval_metric="logloss", verbosity=0)
         return XGBClassifier(**params), params
     if model_name == "catboost":
@@ -262,6 +266,13 @@ def fit_model(model_name: str, model, x, y, *, stage: str,
 
 def positive_probability(model, x) -> np.ndarray:
     if hasattr(model, "predict_proba"):
+        device = model.get_params().get("device", "cpu") if hasattr(model, "get_params") else "cpu"
+        if str(device).startswith("cuda"):
+            try:
+                import cupy as cp
+            except ImportError as exc:
+                raise RuntimeError("XGBoost is configured for CUDA prediction, but CuPy is unavailable") from exc
+            return cp.asnumpy(model.predict_proba(cp.asarray(x))[:, 1])
         return model.predict_proba(x)[:, 1]
     return np.asarray(model.predict(x), dtype=np.float32)
 

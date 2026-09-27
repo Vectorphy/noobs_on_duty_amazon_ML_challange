@@ -28,7 +28,8 @@ def log(message: str) -> None:
     print(time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
 
 
-def input_signature(paths: list[Path], config: dict, model_path: Path) -> str:
+def input_signature(paths: list[Path], config: dict, model_path: Path,
+                   device: str | None = None) -> str:
     files = [{"name": p.name, "size": p.stat().st_size,
               "mtime_ns": p.stat().st_mtime_ns} for p in paths]
     code_files = [Path(__file__).resolve(), Path(__file__).with_name("matching_v2.py")]
@@ -37,6 +38,7 @@ def input_signature(paths: list[Path], config: dict, model_path: Path) -> str:
     model = {"size": model_path.stat().st_size, "mtime_ns": model_path.stat().st_mtime_ns}
     return json.dumps({"files": files, "model_config": config,
                        "model": model, "candidate_cap": config["candidate_cap_per_source"],
+                       "device": device,
                        "feature_engine": FEATURE_ENGINE_VERSION,
                        "target_index_version": TARGET_INDEX_VERSION, "code": code},
                       sort_keys=True, default=list)
@@ -259,7 +261,11 @@ def main() -> None:
     parser.add_argument("--artifacts-dir",type=Path,default=root/"code"/"business_entity_resolution"/"artifacts"/"v2")
     parser.add_argument("--output-dir",type=Path)
     parser.add_argument("--model", choices=MODEL_NAMES, default="lightgbm")
+    parser.add_argument("--device", choices=("cpu", "cuda"),
+                        help="Override prediction device for XGBoost")
     args = parser.parse_args()
+    if args.device and args.model != "xgboost":
+        parser.error("--device is only supported for --model xgboost")
     artifacts = model_artifacts(args.artifacts_dir, args.model)
     output_dir = args.output_dir or artifacts / "test_output"
     metrics_path = artifacts/"training_metrics.json"
@@ -269,6 +275,11 @@ def main() -> None:
     if config.get("estimator", "lightgbm") != args.model:
         raise ValueError(f"Requested {args.model}, but artifacts contain {config.get('estimator')}")
     model = joblib.load(artifacts/"matcher_model.joblib")
+    device = None
+    if args.model == "xgboost":
+        device = args.device or os.environ.get("XGBOOST_DEVICE") or model.get_params().get("device", "cpu")
+        model.set_params(device=device)
+        model.get_booster().set_param({"device": device})
     candidate_cap = int(config["candidate_cap_per_source"])
     columns = tuple(config["feature_indices"])
     work = artifacts / "test_work"
@@ -280,7 +291,7 @@ def main() -> None:
     try:
         signature = input_signature([args.test_dir / name for name in (
             "test_source1.tsv", "test_source2.tsv", "test_source3.tsv")], config,
-            artifacts / "matcher_model.joblib")
+            artifacts / "matcher_model.joblib", device=device)
         probabilities = extract_and_score(con,model,columns,work,signature,candidate_cap)
         summary = write_outputs(con,probabilities,config["decision_threshold"],output_dir,candidate_cap)
         probabilities._mmap.close()
