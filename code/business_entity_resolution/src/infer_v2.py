@@ -13,8 +13,12 @@ from pathlib import Path
 import duckdb
 import joblib
 import numpy as np
+from models_v2 import MODEL_NAMES, model_artifacts, positive_probability
 
-from matching_v2 import KEY_S1_LIMITS, KEY_TARGET_LIMIT, block_keys, pair_features_batch
+from matching_v2 import (
+    CPU_THREADS, FEATURE_ENGINE_VERSION, KEY_S1_LIMITS, KEY_TARGET_LIMIT, block_keys,
+    score_speedup,
+)
 from train_v2 import BATCH, MAX_CANDIDATES_PER_SOURCE, quoted
 
 
@@ -22,12 +26,23 @@ def log(message: str) -> None:
     print(time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
 
 
+def input_signature(paths: list[Path], config: dict, model_path: Path) -> str:
+    files = [{"name": p.name, "size": p.stat().st_size,
+              "mtime_ns": p.stat().st_mtime_ns} for p in paths]
+    code_files = [Path(__file__).resolve(), Path(__file__).with_name("matching_v2.py")]
+    code = [{"name": p.name, "size": p.stat().st_size,
+             "mtime_ns": p.stat().st_mtime_ns} for p in code_files]
+    model = {"size": model_path.stat().st_size, "mtime_ns": model_path.stat().st_mtime_ns}
+    return json.dumps({"files": files, "model_config": config,
+                       "model": model, "candidate_cap": config["candidate_cap_per_source"],
+                       "feature_engine": FEATURE_ENGINE_VERSION, "code": code},
+                      sort_keys=True, default=list)
+
+
 def build_database(test_dir: Path, work: Path) -> duckdb.DuckDBPyConnection:
     work.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(work / "test_v2.duckdb"))
-    # Use 15 of the 16 available logical threads for disk-backed index and
-    # candidate operations.
-    con.execute("SET threads=15")
+    con.execute(f"SET threads={CPU_THREADS}")
     con.execute("SET memory_limit='3GB'")
     spill = Path(tempfile.gettempdir()) / f"business_entity_resolution_v2_spill_{os.getpid()}"
     spill.mkdir(parents=True, exist_ok=True)
@@ -130,41 +145,75 @@ def build_database(test_dir: Path, work: Path) -> duckdb.DuckDBPyConnection:
 
 
 def extract_and_score(con: duckdb.DuckDBPyConnection, model: object,
-                      columns: tuple[int, ...], work: Path) -> np.memmap:
-    n = con.execute("SELECT count(*) FROM candidates WHERE rank<=24").fetchone()[0]
+                      columns: tuple[int, ...], work: Path,
+                      signature: str, candidate_cap: int) -> np.memmap:
+    n = con.execute("SELECT count(*) FROM candidates WHERE rank<=?", [candidate_cap]).fetchone()[0]
+    progress_path = work / "test_scoring_progress.json"
+    feature_path = work / "test_features.npy"
+    probability_path = work / "test_probabilities.npy"
+    offset = 0
+    if progress_path.exists() and feature_path.exists() and probability_path.exists():
+        saved = json.loads(progress_path.read_text(encoding="utf-8"))
+        if saved.get("signature") == signature and saved.get("total_rows") == n:
+            offset = min(n, int(saved.get("completed_rows", 0)))
+            if saved.get("complete"):
+                log(f"Reusing completed test scores: {n:,} pairs")
+                return np.load(probability_path, mmap_mode="r+")
+            if offset:
+                log(f"Resuming test scoring at pair {offset:,}/{n:,}")
     features = np.lib.format.open_memmap(
-        work / "test_features.npy", mode="w+", dtype="float32",
+        feature_path, mode="r+" if offset else "w+", dtype="float32",
         shape=(n, len(columns)),
     )
     probabilities = np.lib.format.open_memmap(
-        work / "test_probabilities.npy", mode="w+", dtype="float32", shape=(n,),
+        probability_path, mode="r+" if offset else "w+", dtype="float32", shape=(n,),
     )
     cursor = con.execute("""
         SELECT c.s1_ix,c.target_ix,c.source_no,s.business_name,s.business_address,
                t.business_name,t.business_address
         FROM candidates c JOIN s1 s ON c.s1_ix=s.ix
         JOIN targets t ON c.target_ix=t.ix
-        WHERE c.rank<=24 ORDER BY c.s1_ix,c.target_ix
-    """)
-    offset = 0
+        WHERE c.rank<=? ORDER BY c.s1_ix,c.target_ix
+    """, [candidate_cap])
+    skipped = offset
+    while skipped:
+        rows = cursor.fetchmany(min(BATCH, skipped))
+        if not rows:
+            raise ValueError("Saved inference checkpoint exceeds candidate query rows")
+        skipped -= len(rows)
+    run_started = time.monotonic()
+    checkpoint_started = run_started
+    checkpoint_offset = offset
     while rows := cursor.fetchmany(BATCH):
         stop = offset + len(rows)
-        batch_features = pair_features_batch(rows, workers=8)
+        batch_features = score_speedup(rows, layout="inference", workers=CPU_THREADS)
         features[offset:stop] = batch_features[:, list(columns)]
-        probabilities[offset:stop] = model.predict_proba(features[offset:stop])[:,1]
+        probabilities[offset:stop] = positive_probability(model, features[offset:stop])
         offset = stop
-        if offset and offset % 500_000 < BATCH:
-            log(f"Scored {offset:,}/{n:,} test candidate pairs")
+        if offset - checkpoint_offset >= 500_000 or offset == n:
+            features.flush()
+            probabilities.flush()
+            progress_tmp = progress_path.with_suffix(".tmp")
+            progress_tmp.write_text(json.dumps({"signature": signature,
+                "completed_rows": offset, "total_rows": n, "complete": offset == n}),
+                encoding="utf-8")
+            os.replace(progress_tmp, progress_path)
+            now = time.monotonic()
+            elapsed = max(now - checkpoint_started, 1e-6)
+            overall_rate = offset / max(now - run_started, 1e-6)
+            eta = (n - offset) / max(overall_rate, 1e-6)
+            log(f"Scored {offset:,}/{n:,} ({offset/n:.1%}); "
+                f"{(offset-checkpoint_offset)/elapsed:,.0f} pairs/s; ETA {eta/60:.1f} min")
+            checkpoint_offset = offset
+            checkpoint_started = now
     if offset != n:
         raise ValueError(f"Scored {offset} test candidates, expected {n}")
-    features.flush()
-    probabilities.flush()
     del features
     return probabilities
 
 
 def write_outputs(con: duckdb.DuckDBPyConnection, probabilities: np.memmap,
-                  threshold: float, output: Path) -> dict[str, int]:
+                  threshold: float, output: Path, candidate_cap: int) -> dict[str, int]:
     output.mkdir(parents=True, exist_ok=True)
     candidates_path = output / "candidate_pairs.tsv"
     matches_path = output / "matching_results.tsv"
@@ -172,8 +221,8 @@ def write_outputs(con: duckdb.DuckDBPyConnection, probabilities: np.memmap,
     pair_cursor = con.cursor().execute("""
         SELECT c.s1_ix,t.entity_id FROM candidates c
         JOIN targets t ON c.target_ix=t.ix
-        WHERE c.rank<=24 ORDER BY c.s1_ix,c.target_ix
-    """)
+        WHERE c.rank<=? ORDER BY c.s1_ix,c.target_ix
+    """, [candidate_cap])
     pair = pair_cursor.fetchone()
     offset = pair_count = match_count = 0
     with candidates_path.open("w",encoding="utf-8",newline="") as candidate_file, \
@@ -205,40 +254,47 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--test-dir",type=Path,default=root/"student_resource"/"dataset"/"test")
     parser.add_argument("--artifacts-dir",type=Path,default=root/"code"/"business_entity_resolution"/"artifacts"/"v2")
-    parser.add_argument("--output-dir",type=Path,default=root/"code"/"business_entity_resolution"/"artifacts"/"v2"/"test_output")
+    parser.add_argument("--output-dir",type=Path)
+    parser.add_argument("--model", choices=MODEL_NAMES, default="lightgbm")
     args = parser.parse_args()
-    artifacts = args.artifacts_dir
+    artifacts = model_artifacts(args.artifacts_dir, args.model)
+    output_dir = args.output_dir or artifacts / "test_output"
     metrics_path = artifacts/"training_metrics.json"
     if not metrics_path.is_file() or "final_validation" not in json.loads(metrics_path.read_text(encoding="utf-8")):
         raise RuntimeError("Complete held-out validation before running test inference")
     config = json.loads((artifacts/"model_config.json").read_text(encoding="utf-8"))
+    if config.get("estimator", "lightgbm") != args.model:
+        raise ValueError(f"Requested {args.model}, but artifacts contain {config.get('estimator')}")
     model = joblib.load(artifacts/"matcher_model.joblib")
-    if config["candidate_cap_per_source"] != 24:
-        raise ValueError("This baseline runner is frozen to the validated cap of 24 per source")
+    candidate_cap = int(config["candidate_cap_per_source"])
     columns = tuple(config["feature_indices"])
-    work = Path(tempfile.gettempdir()) / f"business_entity_resolution_v2_test_{os.getpid()}"
+    work = artifacts / "test_work"
+    work.mkdir(parents=True, exist_ok=True)
     resources = shutil.disk_usage(artifacts).free / 2**30
     if resources < 20:
         raise RuntimeError(f"Need 20 GiB free disk for test inference; found {resources:.1f} GiB")
     con = build_database(args.test_dir,work)
     try:
-        probabilities = extract_and_score(con,model,columns,work)
-        summary = write_outputs(con,probabilities,config["decision_threshold"],args.output_dir)
+        signature = input_signature([args.test_dir / name for name in (
+            "test_source1.tsv", "test_source2.tsv", "test_source3.tsv")], config,
+            artifacts / "matcher_model.joblib")
+        probabilities = extract_and_score(con,model,columns,work,signature,candidate_cap)
+        summary = write_outputs(con,probabilities,config["decision_threshold"],output_dir,candidate_cap)
         probabilities._mmap.close()
     finally:
         con.close()
     report = {"model_config":config,"outputs":summary,
               "test_labels_used":False,"country_note":"France is present only in test; no test labels were read."}
-    (args.output_dir/"inference_summary.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
+    (output_dir/"inference_summary.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
     validator = root/"student_resource"/"utils"/"validate_submission.py"
     import subprocess
     subprocess.run([
         str(Path(__import__("sys").executable)),str(validator),
-        "--matching",str(args.output_dir/"matching_results.tsv"),
-        "--candidate",str(args.output_dir/"candidate_pairs.tsv"),
+        "--matching",str(output_dir/"matching_results.tsv"),
+        "--candidate",str(output_dir/"candidate_pairs.tsv"),
         "--test-dir",str(args.test_dir),
     ],check=True)
-    log(f"Wrote isolated v2 test outputs to {args.output_dir}")
+    log(f"Wrote isolated v2 test outputs to {output_dir}")
 
 
 if __name__ == "__main__":

@@ -36,5 +36,9 @@ submission/
 scratch_*.py
 scratch/
 .uv-cache/
-code/business_entity_resolution/artifacts/v2/work/
+code/business_entity_resolution/artifacts/v2/**/work/
 code/business_entity_resolution/artifacts/v2/fixture/
+code/business_entity_resolution/artifacts/v2/**/test_work/
+code/business_entity_resolution/artifacts/v2/tensorboard/
+code/business_entity_resolution/artifacts/v2/test_output/
+code/business_entity_resolution/artifacts/v2_colab/
