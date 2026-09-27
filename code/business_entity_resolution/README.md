@@ -88,11 +88,23 @@ inference scoring flushes feature/probability arrays and progress metadata
 every 500,000 pairs. Checkpoints are reused only when the data/model signature
 matches. Allow substantial CPU time for the full corpus.
 
-LightGBM training writes TensorBoard event files under
-`artifacts/v2/tensorboard/lightgbm/`. If TensorBoard is installed, view them
-with `tensorboard --logdir code/business_entity_resolution/artifacts/v2/tensorboard`.
-The console also reports training metrics every 25 boosting rounds and feature
-or inference scoring progress, throughput, and estimated time remaining.
+LightGBM fit and tuning runs write TensorBoard event files under
+`artifacts/v2/tensorboard/` and
+`artifacts/v2/tuning/lightgbm/tensorboard/`. Start TensorBoard with both event
+folders so the fit and tuning runs appear together. Run this from the
+repository root; the explicit folders avoid unrelated temporary work
+directories under `artifacts/v2/`:
+
+```powershell
+uv run --python .venv\Scripts\python.exe tensorboard --logdir_spec=training:code\business_entity_resolution\artifacts\v2\tensorboard,tuning:code\business_entity_resolution\artifacts\v2\tuning\lightgbm\tensorboard --port 6006
+```
+
+Open `http://localhost:6006` and select the `development/binary_logloss` tags
+for tuning trials. A currently active feature-extraction stage has no model
+loss curve yet; curves appear when model fitting starts. Event files flush at
+least every five seconds. The console also reports training metrics every 25
+boosting rounds and feature or inference scoring progress, throughput, and
+estimated time remaining.
 
 The finished run writes `artifacts/v2/matcher_model.joblib`,
 `model_config.json`, `training_metrics.json`, and `split_assignments.parquet`.
