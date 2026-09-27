@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import shutil
 import time
@@ -62,14 +63,14 @@ def build_database(test_dir: Path, work: Path) -> duckdb.DuckDBPyConnection:
     s3path = quoted(test_dir / "test_source3.tsv")
     log("Loading supplied test source records")
     con.execute(f"""
-        CREATE OR REPLACE TABLE s1 AS
+        CREATE TABLE IF NOT EXISTS s1 AS
         SELECT CAST(row_number() OVER (ORDER BY entity_id)-1 AS INTEGER) ix,
                entity_id, coalesce(business_name,'') business_name,
                coalesce(business_address,'') business_address, country
         FROM read_csv({s1path}, {csv})
     """)
     con.execute(f"""
-        CREATE OR REPLACE TABLE targets AS
+        CREATE TABLE IF NOT EXISTS targets AS
         SELECT CAST(row_number() OVER ()-1 AS INTEGER) ix, entity_id,
                coalesce(business_name,'') business_name,
                coalesce(business_address,'') business_address, country, source_no
@@ -81,7 +82,7 @@ def build_database(test_dir: Path, work: Path) -> duckdb.DuckDBPyConnection:
     """)
     log("Building country-aware v2 blocking keys")
     con.execute("""
-        CREATE OR REPLACE TABLE s1_keys_all AS
+        CREATE TABLE IF NOT EXISTS s1_keys_all AS
         SELECT s.ix s1_ix, s.country, u.key
         FROM s1 s, UNNEST(block_keys(s.business_name,s.business_address)) u(key)
     """)
@@ -90,64 +91,73 @@ def build_database(test_dir: Path, work: Path) -> duckdb.DuckDBPyConnection:
         for prefix, limit in KEY_S1_LIMITS.items()
     )
     con.execute(f"""
-        CREATE OR REPLACE TABLE valid_keys AS
+        CREATE TABLE IF NOT EXISTS valid_keys AS
         SELECT country,key FROM s1_keys_all GROUP BY country,key HAVING {having}
     """)
     con.execute("""
-        CREATE OR REPLACE TABLE s1_keys AS
+        CREATE TABLE IF NOT EXISTS s1_keys AS
         SELECT k.* FROM s1_keys_all k JOIN valid_keys v USING(country,key)
     """)
-    con.execute("DROP TABLE s1_keys_all")
+    con.execute("DROP TABLE IF EXISTS s1_keys_all")
     con.execute("""
-        CREATE OR REPLACE TABLE target_keys_all AS
+        CREATE TABLE IF NOT EXISTS target_keys_all AS
         SELECT t.ix target_ix,t.country,u.key
         FROM targets t, UNNEST(block_keys(t.business_name,t.business_address)) u(key)
         JOIN valid_keys v ON t.country=v.country AND u.key=v.key
     """)
     con.execute(f"""
-        CREATE OR REPLACE TABLE target_keys AS
+        CREATE TABLE IF NOT EXISTS target_keys AS
         SELECT k.* FROM target_keys_all k JOIN (
             SELECT country,key FROM target_keys_all GROUP BY country,key
             HAVING count(*)<={KEY_TARGET_LIMIT}
         ) v USING(country,key)
     """)
-    con.execute("DROP TABLE target_keys_all")
+    con.execute("DROP TABLE IF EXISTS target_keys_all")
 
-    con.execute("""
-        CREATE OR REPLACE TABLE candidates (
-            s1_ix INTEGER,target_ix INTEGER,source_no TINYINT,
-            rank TINYINT,rank_score REAL
-        )
-    """)
-    for part in range(32):
-        con.execute(f"""
-            INSERT INTO candidates
-            WITH pairs AS (
-                SELECT DISTINCT sk.s1_ix,tk.target_ix
-                FROM s1_keys sk JOIN target_keys tk USING(country,key)
-                WHERE sk.s1_ix % 32={part}
-            ), scored AS (
-                SELECT p.s1_ix,p.target_ix,t.source_no,t.entity_id target_id,
-                       CAST(CASE WHEN s.business_address<>'' AND t.business_address<>''
-                           THEN 0.65*jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
-                              + 0.35*jaro_winkler_similarity(lower(s.business_address),lower(t.business_address))
-                           ELSE jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
-                       END AS REAL) rank_score
-                FROM pairs p JOIN s1 s ON p.s1_ix=s.ix
-                             JOIN targets t ON p.target_ix=t.ix
-            ), ranked AS (
-                SELECT *,row_number() OVER (
-                    PARTITION BY s1_ix,source_no ORDER BY rank_score DESC,target_id
-                ) rank FROM scored
+    tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
+    has_candidates = False
+    if "candidates" in tables:
+        cand_count = con.execute("SELECT count(*) FROM candidates").fetchone()[0]
+        if cand_count > 0:
+            has_candidates = True
+            log(f"Reusing existing candidates table: {cand_count:,} pairs")
+
+    if not has_candidates:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS candidates (
+                s1_ix INTEGER,target_ix INTEGER,source_no TINYINT,
+                rank TINYINT,rank_score REAL
             )
-            SELECT s1_ix,target_ix,source_no,CAST(rank AS TINYINT),rank_score
-            FROM ranked WHERE rank<={MAX_CANDIDATES_PER_SOURCE}
         """)
-        if part == 0 or (part + 1) % 4 == 0:
-            n = con.execute("SELECT count(*) FROM candidates").fetchone()[0]
-            log(f"Candidate partitions {part+1}/32; retained {n:,} pairs")
-        if part and (part + 1) % 4 == 0 and shutil.disk_usage(work).free < 5 * 2**30:
-            raise RuntimeError("Less than 5 GiB free disk remains during v2 candidate generation")
+        for part in range(32):
+            con.execute(f"""
+                INSERT INTO candidates
+                WITH pairs AS (
+                    SELECT DISTINCT sk.s1_ix,tk.target_ix
+                    FROM s1_keys sk JOIN target_keys tk USING(country,key)
+                    WHERE sk.s1_ix % 32={part}
+                ), scored AS (
+                    SELECT p.s1_ix,p.target_ix,t.source_no,t.entity_id target_id,
+                           CAST(CASE WHEN s.business_address<>'' AND t.business_address<>''
+                               THEN 0.65*jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
+                                  + 0.35*jaro_winkler_similarity(lower(s.business_address),lower(t.business_address))
+                               ELSE jaro_winkler_similarity(lower(s.business_name),lower(t.business_name))
+                           END AS REAL) rank_score
+                    FROM pairs p JOIN s1 s ON p.s1_ix=s.ix
+                                 JOIN targets t ON p.target_ix=t.ix
+                ), ranked AS (
+                    SELECT *,row_number() OVER (
+                        PARTITION BY s1_ix,source_no ORDER BY rank_score DESC,target_id
+                    ) rank FROM scored
+                )
+                SELECT s1_ix,target_ix,source_no,CAST(rank AS TINYINT),rank_score
+                FROM ranked WHERE rank<={MAX_CANDIDATES_PER_SOURCE}
+            """)
+            if part == 0 or (part + 1) % 4 == 0:
+                n = con.execute("SELECT count(*) FROM candidates").fetchone()[0]
+                log(f"Candidate partitions {part+1}/32; retained {n:,} pairs")
+            if part and (part + 1) % 4 == 0 and shutil.disk_usage(work).free < 5 * 2**30:
+                raise RuntimeError("Less than 5 GiB free disk remains during v2 candidate generation")
     return con
 
 
@@ -169,15 +179,18 @@ def extract_and_score(con: duckdb.DuckDBPyConnection, model: object,
         WHERE c.rank<=24 ORDER BY c.s1_ix,c.target_ix
     """)
     offset = 0
-    while rows := cursor.fetchmany(BATCH):
-        stop = offset + len(rows)
-        for i, row in enumerate(rows, offset):
-            _,_,source,name1,addr1,name2,addr2 = row
-            features[i] = pair_features(name1,addr1,name2,addr2,source)[list(columns)]
-        probabilities[offset:stop] = model.predict_proba(features[offset:stop])[:,1]
-        offset = stop
-        if offset and offset % 500_000 < BATCH:
-            log(f"Scored {offset:,}/{n:,} test candidate pairs")
+    def _extract_row(r):
+        return pair_features(r[3], r[4], r[5], r[6], r[2])[list(columns)]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
+        while rows := cursor.fetchmany(BATCH):
+            stop = offset + len(rows)
+            for i, feat in enumerate(executor.map(_extract_row, rows), offset):
+                features[i] = feat
+            probabilities[offset:stop] = model.predict_proba(features[offset:stop])[:, 1]
+            offset = stop
+            if offset and offset % 500_000 < BATCH:
+                log(f"Scored {offset:,}/{n:,} test candidate pairs")
     if offset != n:
         raise ValueError(f"Scored {offset} test candidates, expected {n}")
     features.flush()
@@ -241,8 +254,9 @@ def main() -> None:
     columns = tuple(config["feature_indices"])
     work = artifacts/"test_work_15threads"
     resources = shutil.disk_usage(artifacts).free / 2**30
-    if resources < 25:
-        raise RuntimeError(f"Need 25 GiB free disk for test inference; found {resources:.1f} GiB")
+    needed_disk = 5 if (work/"test_v2.duckdb").exists() else 25
+    if resources < needed_disk:
+        raise RuntimeError(f"Need {needed_disk} GiB free disk for test inference; found {resources:.1f} GiB")
     con = build_database(args.test_dir,work)
     try:
         probabilities = extract_and_score(con,model,columns,work)
