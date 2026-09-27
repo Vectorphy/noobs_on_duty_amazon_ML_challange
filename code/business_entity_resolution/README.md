@@ -75,6 +75,45 @@ about 16.5× faster than the SciPy prototype on the saved sample, with similar
 retrieval recall. It still needs a complete development candidate oracle before
 use in model training or inference.
 
+### Separate BM25 training and development runs
+
+`bm25_pipeline/train.py` and `bm25_pipeline/develop.py` create separate,
+seed-42 candidate samples from the frozen v2 Source 1 training and development
+splits. Training candidate labels are joined only after retrieval. Development
+reports sampled positive-link recall by target source and complete-link entity
+recall; this is a retrieval diagnostic, not the model's official validation
+F₀.₅. The default is bounded to 150,000 reference documents and 20,000 target
+queries per country. Raise these limits for a broader pass. Artifacts are kept
+separately in `artifacts/bm25_pipeline/train/` and
+`artifacts/bm25_pipeline/development/`, and are ignored by Git.
+
+The retrieval pilot accepts `--backend scipy`, `--backend bm25s`, or
+`--backend cupy`. CuPy accelerates the sparse BM25 query/document matrix
+product on CUDA; normalization, vectorization, candidate ranking, and output
+remain on CPU. The complete country document index must fit in GPU memory. The
+code checks this before transfer and reports an actionable error if memory is
+insufficient. Install the matching CUDA wheel from
+`requirements-bm25-gpu.txt` for CUDA 12.x, then use a larger batch for GPU
+throughput. CPU BM25S remains available when no GPU is present.
+
+Run the separate workflows with uv from the repository root:
+
+```powershell
+uv run --python .venv\Scripts\python.exe code\business_entity_resolution\bm25_pipeline\train.py --backend bm25s
+uv run --python .venv\Scripts\python.exe code\business_entity_resolution\bm25_pipeline\develop.py --backend bm25s
+```
+
+For CUDA 12.x, install the optional wheel and select `--backend cupy`. The
+Colab notebook `bm25_pipeline/bm25_colab_pipeline.ipynb` mounts Drive, installs
+the retrieval dependencies with uv, selects CuPy when it detects a usable GPU,
+and runs both split-specific scripts. It uses only the supplied training files;
+test files are not read.
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe -r code\business_entity_resolution\requirements-bm25-gpu.txt
+uv run --python .venv\Scripts\python.exe code\business_entity_resolution\bm25_pipeline\develop.py --backend cupy --batch-size 512
+```
+
 The run requires at
 least 3.5 GiB available RAM and 25 GiB free disk at its start. Its DuckDB work
 database and feature arrays stay under `artifacts/v2/work/`; test inference uses

@@ -1,0 +1,3 @@
+# Optional GPU sparse-scoring backend (CUDA 12.x runtime).
+# Choose a matching cupy-cudaXXx wheel if the Colab CUDA major version differs.
+cupy-cuda12x>=14.0,<15

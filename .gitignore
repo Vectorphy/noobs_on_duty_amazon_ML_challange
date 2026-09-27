@@ -42,6 +42,7 @@ code/business_entity_resolution/artifacts/v2/**/test_work/
 code/business_entity_resolution/artifacts/v2/tensorboard/
 code/business_entity_resolution/artifacts/v2/test_output/
 code/business_entity_resolution/artifacts/v2_colab/
+code/business_entity_resolution/artifacts/bm25_pipeline/
 code/business_entity_resolution/artifacts/v2/**/*.joblib
 code/business_entity_resolution/artifacts/v2/model_config.json
 code/business_entity_resolution/artifacts/v2/training_metrics.json

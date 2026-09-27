@@ -43,9 +43,14 @@ def _bm25_documents(matrix: csr_matrix, k1: float = 1.5, b: float = 0.75) -> csr
 
 def _rank_batch(queries, doc_scores: csr_matrix, doc_ids: np.ndarray,
                 target_rows, ks: tuple[int, ...]) -> list[tuple[int, int, int, int, float, str]]:
+    scores = queries @ doc_scores.T
+    return _rank_batch_from_scores(scores, doc_ids, target_rows, ks)
+
+
+def _rank_batch_from_scores(scores, doc_ids: np.ndarray, target_rows,
+                            ks: tuple[int, ...]) -> list[tuple[int, int, int, int, float, str]]:
     output = []
     max_k = max(ks)
-    scores = queries @ doc_scores.T
     for row_ix, target in enumerate(target_rows):
         start, stop = scores.indptr[row_ix:row_ix + 2]
         doc_ix = scores.indices[start:stop]
@@ -108,11 +113,49 @@ def _retrieve_country(doc_rows, target_rows, batch_size: int = 64,
                                  min_df=2, max_df=0.8)
     doc_counts = vectorizer.fit_transform(doc_text).tocsr()
     doc_scores = _bm25_documents(doc_counts)
+    if backend == "cupy":
+        try:
+            import cupy as cp
+            import cupyx.scipy.sparse as csp
+        except ImportError as exc:
+            raise RuntimeError(
+                "GPU BM25 requires CuPy. Install the matching CuPy CUDA wheel; "
+                "Colab CUDA 12.x runtimes use cupy-cuda12x."
+            ) from exc
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            raise RuntimeError("CuPy is installed, but no CUDA GPU is visible.")
+        csr_bytes = (doc_scores.data.nbytes + doc_scores.indices.nbytes +
+                     doc_scores.indptr.nbytes)
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+        if csr_bytes > free_bytes * 0.8:
+            raise MemoryError(
+                f"BM25 index needs about {csr_bytes / 2**30:.2f} GiB; "
+                f"only {free_bytes / 2**30:.2f} GiB GPU memory is free. "
+                "Use --backend scipy/bm25s or a smaller country corpus."
+            )
+        try:
+            gpu_docs = csp.csr_matrix(doc_scores)
+        except cp.cuda.memory.OutOfMemoryError as exc:
+            raise MemoryError("GPU ran out of memory while uploading the BM25 index.") from exc
+    elif backend not in {"scipy", "bm25s"}:
+        raise ValueError(f"Unknown BM25 backend: {backend}")
     candidates = []
     for start in range(0, len(target_rows), batch_size):
         batch = target_rows[start:start + batch_size]
         q = vectorizer.transform([_text(row[3], row[4]) for row in batch]).tocsr()
-        candidates.extend(_rank_batch(q, doc_scores, doc_ids, batch, ks))
+        if backend == "cupy":
+            try:
+                gpu_q = csp.csr_matrix(q)
+                scores = (gpu_q @ gpu_docs.T).get()
+            except cp.cuda.memory.OutOfMemoryError as exc:
+                raise MemoryError(
+                    "GPU ran out of memory while scoring a query batch. "
+                    "Reduce --batch-size and retry."
+                ) from exc
+            batch_candidates = _rank_batch_from_scores(scores, doc_ids, batch, ks)
+        else:
+            batch_candidates = _rank_batch(q, doc_scores, doc_ids, batch, ks)
+        candidates.extend(batch_candidates)
     elapsed = time.monotonic() - started
     return candidates, elapsed
 
@@ -120,7 +163,7 @@ def _retrieve_country(doc_rows, target_rows, batch_size: int = 64,
 def run_pilot(artifacts: Path, docs_per_country: int = 150_000,
               targets_per_country: int = 20_000,
               ks: tuple[int, ...] = (4, 8, 16, 32, 64, 128),
-              backend: str = "scipy") -> dict:
+              backend: str = "scipy", batch_size: int = 64) -> dict:
     work = artifacts / "work"
     output = artifacts / "tuning" / "retrieval"
     output.mkdir(parents=True, exist_ok=True)
@@ -152,7 +195,8 @@ def run_pilot(artifacts: Path, docs_per_country: int = 150_000,
             country_targets = [(target_ix, source_no, country, name, address, entity_id)
                                for target_ix, source_no, target_country, name, address, entity_id in targets
                                if target_country == country]
-            pairs, elapsed = _retrieve_country(country_docs, country_targets, ks=ks,
+            pairs, elapsed = _retrieve_country(country_docs, country_targets,
+                                                batch_size=batch_size, ks=ks,
                                                 backend=backend)
             all_pairs.extend((country, *row) for row in pairs)
             country_runtime[str(country)] = {
@@ -179,6 +223,7 @@ def run_pilot(artifacts: Path, docs_per_country: int = 150_000,
         report = {
             "method": "country-specific character-trigram BM25 over name plus address",
             "backend": backend,
+            "batch_size": batch_size,
             "seed": 42,
             "labels_used_for_retrieval": False,
             "retrieval_direction": "sampled S2/S3 targets query sampled development S1 references",
@@ -341,7 +386,9 @@ def main() -> None:
                         default=root / "code/business_entity_resolution/artifacts/v2")
     parser.add_argument("--docs-per-country", type=int, default=150_000)
     parser.add_argument("--targets-per-country", type=int, default=20_000)
-    parser.add_argument("--backend", choices=("scipy", "bm25s"), default="scipy")
+    parser.add_argument("--backend", choices=("scipy", "bm25s", "cupy"), default="scipy")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="Queries per scoring batch; raise for GPU throughput, lower for limited GPU RAM")
     parser.add_argument("--caps", default="4,8,16,32,64,128",
                         help="Comma-separated candidate caps to evaluate")
     parser.add_argument("--evaluate-existing", action="store_true",
@@ -355,7 +402,8 @@ def main() -> None:
                                    args.targets_per_country, ks=caps)
               if args.evaluate_existing else
               run_pilot(args.artifacts_dir, args.docs_per_country,
-                        args.targets_per_country, ks=caps, backend=args.backend))
+                        args.targets_per_country, ks=caps, backend=args.backend,
+                        batch_size=args.batch_size))
     print(json.dumps(report, indent=2), flush=True)
 
 
