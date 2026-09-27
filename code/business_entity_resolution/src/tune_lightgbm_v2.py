@@ -16,7 +16,7 @@ from matching_v2 import FEATURES, FEATURE_ENGINE_VERSION
 from models_v2 import fit_model
 from train_v2 import (
     EXPECTED_ROWS, SEED, connect, ensure_train_selection, evaluate_model,
-    extract_features, file_signature, split_arrays,
+    extract_features, file_signature, score_grid, split_arrays,
 )
 from matching_v2 import f05
 
