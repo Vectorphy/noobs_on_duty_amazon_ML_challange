@@ -36,7 +36,8 @@ from lightgbm import LGBMClassifier
 from matching_v3 import (
     ABLATION_GROUPS, BASE_FEATURES, FEATURES, KEY_S1_LIMITS,
     KEY_TARGET_LIMIT, MAX_CANDIDATES_PER_SOURCE, MAX_CANDIDATES_DEEP,
-    DEEP_CANDIDATE_THRESHOLD, block_keys, f05, pair_features,
+    DEEP_CANDIDATE_THRESHOLD, SINGLETON_GUARD_THRESHOLD,
+    block_keys, f05, pair_features,
 )
 
 
@@ -465,9 +466,11 @@ def split_arrays(con: duckdb.DuckDBPyConnection, split: int) -> dict:
 
 def model_for(columns: tuple[int, ...], memory_bounded: bool = False) -> LGBMClassifier:
     return LGBMClassifier(
-        n_estimators=300, learning_rate=0.05,
-        num_leaves=15 if memory_bounded else 31,
-        min_child_samples=100, max_bin=31 if memory_bounded else 63,
+        n_estimators=800, learning_rate=0.02,
+        num_leaves=15 if memory_bounded else 63,
+        min_child_samples=50, max_bin=31 if memory_bounded else 127,
+        subsample=0.8, subsample_freq=1,
+        colsample_bytree=0.8,
         n_jobs=1 if memory_bounded else 4, force_col_wise=memory_bounded,
         random_state=SEED, importance_type="gain", verbosity=-1,
     )
@@ -616,17 +619,39 @@ def candidate_diagnostics(con: duckdb.DuckDBPyConnection, cap: int, split: int) 
 
 
 def final_slices(meta: np.memmap, prob: np.memmap, split: dict,
-                 cap: int, threshold: float) -> dict:
+                 cap: int, threshold: float,
+                 singleton_guard: float = 0.0) -> dict:
+    """Score dev/val split at (threshold, singleton_guard).
+
+    C3 singleton guard: if an entity's max candidate score < singleton_guard
+    we force prediction = empty (0 predicted matches) even if some candidates
+    exceed the match threshold.  This dramatically improves precision on
+    singletons at negligible recall cost when tuned correctly.
+    """
     n = len(split["truth"])
+    # Build per-entity max probability for the singleton guard
+    max_prob = np.zeros(n, dtype=np.float32)
     predicted = np.zeros(n, dtype=np.int32)
     tp = np.zeros(n, dtype=np.int32)
     for start in range(0, len(meta), BATCH):
         stop = min(len(meta), start + BATCH)
         piece = meta[start:stop]
-        use = (piece["rank"] <= cap) & (prob[start:stop] >= threshold)
-        local = split["ix_to_local"][piece["s1"][use]]
-        np.add.at(predicted, local, 1)
-        np.add.at(tp, local, piece["positive"][use])
+        use_rank = piece["rank"] <= cap
+        local_all = split["ix_to_local"][piece["s1"][use_rank]]
+        p_all = prob[start:stop][use_rank]
+        # Track max prob per entity
+        np.maximum.at(max_prob, local_all, p_all)
+        # Count predictions above match threshold
+        above = p_all >= threshold
+        if above.any():
+            local_above = local_all[above]
+            np.add.at(predicted, local_above, 1)
+            np.add.at(tp, local_above, piece["positive"][use_rank][above])
+    # C3: zero out predictions for entities below singleton guard
+    if singleton_guard > 0.0:
+        guarded = max_prob < singleton_guard
+        predicted = np.where(guarded, 0, predicted)
+        tp = np.where(guarded, 0, tp)
     scores = f05(split["truth"], predicted, tp)
     groups = {
         "country": {v: split["country"] == v for v in np.unique(split["country"])},
@@ -650,6 +675,48 @@ def final_slices(meta: np.memmap, prob: np.memmap, split: dict,
         "pair_recall": float(tp.sum() / split["truth"].sum()) if split["truth"].sum() else 0.0,
         "slices": slices,
     }
+
+
+def find_singleton_guard_threshold(
+    meta: np.memmap, prob: np.memmap, split: dict, cap: int, match_threshold: float
+) -> tuple[float, float]:
+    """C3: grid-search the singleton guard threshold on the development split.
+
+    For each candidate guard value g, entities whose max candidate probability
+    is < g are predicted as singletons (zero matches) regardless of the match
+    threshold.  Searches g in [0, 0.05, 0.10, ..., 0.70].
+    Returns (best_guard, best_macro_f05).
+    """
+    n = len(split["truth"])
+    # Single scan: per-entity max prob, predicted count, tp at match_threshold
+    max_prob = np.zeros(n, dtype=np.float32)
+    predicted_base = np.zeros(n, dtype=np.int32)
+    tp_base = np.zeros(n, dtype=np.int32)
+    for start in range(0, len(meta), BATCH):
+        stop = min(len(meta), start + BATCH)
+        piece = meta[start:stop]
+        use = piece["rank"] <= cap
+        local = split["ix_to_local"][piece["s1"][use]]
+        p = prob[start:stop][use]
+        np.maximum.at(max_prob, local, p)
+        above = p >= match_threshold
+        if above.any():
+            local_above = local[above]
+            np.add.at(predicted_base, local_above, 1)
+            np.add.at(tp_base, local_above, piece["positive"][use][above])
+    best_score = float(f05(split["truth"], predicted_base, tp_base).mean())
+    best_guard = 0.0
+    for step in range(5, 71, 5):   # 0.05 .. 0.70
+        guard = step / 100.0
+        guarded = max_prob < guard
+        pred = np.where(guarded, 0, predicted_base)
+        tp = np.where(guarded, 0, tp_base)
+        score = float(f05(split["truth"], pred, tp).mean())
+        if score > best_score:
+            best_score = score
+            best_guard = guard
+    log(f"C3 singleton guard: threshold={best_guard:.2f}, dev F0.5={best_score:.5f}")
+    return best_guard, best_score
 
 
 def run(data: Path, artifacts: Path, memory_bounded: bool = False) -> None:
@@ -763,13 +830,18 @@ def run(data: Path, artifacts: Path, memory_bounded: bool = False) -> None:
         log("C1: computing per-country thresholds on development split")
         dev_prob = predict_memmap(model, x_dev, chosen, work / "dev_prob_final.npy")
         country_thresholds = score_grid_per_country(m_dev, dev_prob, dev, cap)
+
+        log("C3: searching singleton guard threshold on development split")
+        singleton_guard, sg_dev_f05 = find_singleton_guard_threshold(
+            m_dev, dev_prob, dev, cap, threshold
+        )
         del dev_prob
 
         log("Scoring untouched final-validation split once")
         x_val, m_val = extract_features(con, work, "validation", "candidates", 2, cap)
         val = split_arrays(con, 2)
         val_prob = predict_memmap(model, x_val, chosen, work / "validation_prob.npy")
-        validation = final_slices(m_val, val_prob, val, cap, threshold)
+        validation = final_slices(m_val, val_prob, val, cap, threshold, singleton_guard)
         diagnostics = {
             "development": candidate_diagnostics(con, cap, 1),
             "validation": candidate_diagnostics(con, cap, 2),
@@ -814,6 +886,7 @@ def run(data: Path, artifacts: Path, memory_bounded: bool = False) -> None:
             "deep_cap_per_source": MAX_CANDIDATES_DEEP,
             "deep_candidate_threshold": DEEP_CANDIDATE_THRESHOLD,
             "decision_threshold": threshold,
+            "singleton_guard_threshold": singleton_guard,
             "country_thresholds": {k: v["threshold"] for k, v in country_thresholds.items()},
             "mutual_exclusivity_suppression": True,
             "seed": SEED,

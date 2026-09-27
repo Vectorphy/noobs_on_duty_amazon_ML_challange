@@ -11,11 +11,19 @@ A2  Postal-code compound blocking - US 5-digit ZIPs, Indian 6-digit PINs,
 A3  Adaptive candidate depth - MAX_CANDIDATES_DEEP=48 and
     DEEP_CANDIDATE_THRESHOLD=0.72 exported for train/infer.
 
+A4  4-char prefix key (q:) - high-recall catch-all for fuzz/typo variants.
+A5  Initials key (i:) - catches "MGH" = "Maharashtra General Hospital".
+A6  First-two-token bigram key (b:) - catches word-order swaps.
+
 B1  location_mismatch feature: 1.0 when records carry differing state/postal.
-
 B2  tfidf_name_cosine feature: TF-IDF weighted cosine on name tokens.
-
 B3  street_number_match feature: +1/0/-1.
+B4  clean_name_jw: JW similarity on legal-suffix-stripped names.
+B5  sorted_token_match: 1.0 when sorted name-token fingerprints are equal.
+B6  shared_rare_token: normalised max IDF weight of shared name token.
+B7  city_locality_match: 1.0 when last significant address token matches.
+
+SINGLETON_GUARD_THRESHOLD exported for inference singleton guard (C3).
 
 No GPU engine dependency.
 """
@@ -63,6 +71,10 @@ V3_FEATURES = (
     "location_mismatch",
     "tfidf_name_cosine",
     "street_number_match",
+    "clean_name_jw",
+    "sorted_token_match",
+    "shared_rare_token",
+    "city_locality_match",
 )
 FEATURES = BASE_FEATURES + EXTRA_FEATURES + V3_FEATURES
 
@@ -75,13 +87,19 @@ ABLATION_GROUPS = {
     "location_mismatch":          (20,),
     "tfidf_cosine":               (21,),
     "street_number_match":        (22,),
+    "clean_name_jw":              (23,),
+    "sorted_token_match":         (24,),
+    "shared_rare_token":          (25,),
+    "city_locality_match":        (26,),
 }
 
 MAX_CANDIDATES_PER_SOURCE  = 32
 MAX_CANDIDATES_DEEP        = 48
 DEEP_CANDIDATE_THRESHOLD   = 0.72
+SINGLETON_GUARD_THRESHOLD  = 0.35   # C3: entities whose max score < this are predicted as singletons
 
-KEY_S1_LIMITS   = {"n": 512, "t": 64, "a": 64, "w": 16, "p": 128, "z": 256}
+KEY_S1_LIMITS   = {"n": 512, "t": 64, "a": 64, "w": 16, "p": 128, "z": 256,
+                   "q": 200, "i": 64, "b": 128}
 KEY_TARGET_LIMIT = 2048
 
 # -----------------------------------------------------------------------
@@ -360,6 +378,65 @@ def location_mismatch(addr1: str, addr2: str) -> float:
 
 
 # -----------------------------------------------------------------------
+# City / locality tail token (B7)
+# -----------------------------------------------------------------------
+
+def _extract_city_token(address: str) -> Optional[str]:
+    """Last significant non-numeric, non-stopword token in the address."""
+    combined_stop = STOP_WORDS | ADDR_STOP_WORDS
+    words = [
+        w for w in normalize(address).split()
+        if len(w) >= 4 and not w.isdigit() and w not in combined_stop
+    ]
+    return words[-1] if words else None
+
+
+def city_locality_match(addr1: str, addr2: str) -> float:
+    """1.0 when both addresses share the same trailing locality token."""
+    c1 = _extract_city_token(addr1)
+    c2 = _extract_city_token(addr2)
+    if c1 is None or c2 is None:
+        return 0.0
+    return 1.0 if c1 == c2 else 0.0
+
+
+# -----------------------------------------------------------------------
+# Shared rare-token score (B6)
+# -----------------------------------------------------------------------
+
+def shared_rare_token_score(name1: str, name2: str) -> float:
+    """Normalised max IDF weight of tokens shared between both names.
+
+    A token unique to a specific business (high IDF / unknown to the table)
+    is a very strong positive signal when shared.  Returns 0–1.
+    """
+    t1 = {w for w in normalize(name1).split() if len(w) >= 3 and w not in STOP_WORDS}
+    t2 = {w for w in normalize(name2).split() if len(w) >= 3 and w not in STOP_WORDS}
+    common = t1 & t2
+    if not common:
+        return 0.0
+    max_idf = max(_IDF.get(w, _IDF_DEFAULT) for w in common)
+    return float(min(max_idf / _IDF_DEFAULT, 1.0))
+
+
+# -----------------------------------------------------------------------
+# Sorted-token fingerprint match (B5)
+# -----------------------------------------------------------------------
+
+def sorted_fingerprint_match(name1: str, name2: str) -> float:
+    """1.0 when alphabetically-sorted name tokens are identical.
+
+    Catches word-order permutations that fool fuzz.ratio and JW.
+    """
+    f1 = " ".join(sorted(w for w in normalize(name1).split() if w not in STOP_WORDS))
+    f2 = " ".join(sorted(w for w in normalize(name2).split() if w not in STOP_WORDS))
+    if not f1 or not f2:
+        return 0.0
+    return 1.0 if f1 == f2 else 0.0
+
+
+
+# -----------------------------------------------------------------------
 # Core text utilities (unchanged from v2)
 # -----------------------------------------------------------------------
 
@@ -403,7 +480,7 @@ def clean_company_name(value: str) -> str:
 # -----------------------------------------------------------------------
 
 def block_keys(name: str, address: str) -> list[str]:
-    """v3 blocking keys: v2 keys + p: phonetic + z: postal compound."""
+    """v3 blocking keys: v2 keys + p: phonetic + z: postal + q: prefix + i: initials + b: bigram."""
     clean_name = normalize(name)
     name_words = [w for w in clean_name.split() if len(w) >= 3 and w not in STOP_WORDS]
     address_words = tokens(address, STOP_WORDS | ADDR_STOP_WORDS, 4)
@@ -419,20 +496,36 @@ def block_keys(name: str, address: str) -> list[str]:
     )
     keys.update("w:" + word for word in address_words if len(word) >= 6)
 
+    # A1: Double Metaphone phonetic key on first name token
     if name_words:
         primary, _ = double_metaphone(name_words[0])
         if primary and len(primary) >= 2:
             keys.add("p:" + primary)
 
+    # A2: Postal-code compound key
     postal = extract_postal_codes(address)
     if postal and name_words:
         keys.add("z:" + postal[0] + ":" + name_words[0])
+
+    # A4: 4-char prefix key — high-recall catch-all for fuzz/typo variants
+    if len(clean_name) >= 4:
+        keys.add("q:" + clean_name[:4])
+
+    # A5: Initials key — catches abbreviations like "MGH" for "Maharashtra General Hospital"
+    if len(name_words) >= 2:
+        initials = "".join(w[0] for w in name_words if w)
+        if len(initials) >= 2:
+            keys.add("i:" + initials)
+
+    # A6: First-two-token bigram — catches word-order swaps between sources
+    if len(name_words) >= 2:
+        keys.add("b:" + name_words[0] + "_" + name_words[1])
 
     return sorted(keys)
 
 
 # -----------------------------------------------------------------------
-# Pair features (20 v2 + 3 v3 = 23)
+# Pair features (20 v2 + 7 v3 = 27)
 # -----------------------------------------------------------------------
 
 def pair_features(
@@ -471,6 +564,14 @@ def pair_features(
         location_mismatch(addr1, addr2),
         tfidf_cosine(name1, name2),
         street_number_match(addr1, addr2),
+        # B4: Jaro-Winkler on legal-suffix-stripped names
+        fuzz.ratio(clean1, clean2) / 100.0,
+        # B5: Sorted-token fingerprint match
+        sorted_fingerprint_match(name1, name2),
+        # B6: Shared rare-token score
+        shared_rare_token_score(name1, name2),
+        # B7: City / locality tail-token match
+        city_locality_match(addr1, addr2),
     ]
     return np.asarray(out, dtype=np.float32)
 
@@ -497,11 +598,16 @@ def f05(
 
 if __name__ == "__main__":
     n = len(pair_features("A", "1 Road", "A", "1 Road", 2))
-    assert n == 23 == len(FEATURES), f"Expected 23, got {n}"
+    assert n == 27 == len(FEATURES), f"Expected 27, got {n}"
     assert np.allclose(f05(np.array([0,1,2]),np.array([0,1,2]),np.array([0,0,1])),[1,0,.5])
     ks = block_keys("Kalyani Medicals", "Pin 700130 Kolkata")
     assert any(k.startswith("p:") for k in ks), f"Missing p: in {ks}"
     assert any(k.startswith("z:") for k in ks), f"Missing z: in {ks}"
+    assert any(k.startswith("q:") for k in ks), f"Missing q: in {ks}"
+    assert any(k.startswith("i:") for k in ks), f"Missing i: in {ks}"
     assert location_mismatch("105 Main St IL 60601","105 Main St CA 90001") == 1.0
     assert street_number_match("105 Ribbon Ln","11 Ribbon Ln") == -1.0
-    print("All v3 self-tests passed.")
+    assert sorted_fingerprint_match("Widget Alpha", "Alpha Widget") == 1.0
+    assert shared_rare_token_score("Zydeco Pharma", "Zydeco Pharma") > 0.0
+    assert city_locality_match("10 MG Road Bangalore", "22 MG Road Bangalore") == 1.0
+    print("All v3 self-tests passed (27 features).")

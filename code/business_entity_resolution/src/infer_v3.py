@@ -27,7 +27,10 @@ import duckdb
 import joblib
 import numpy as np
 
-from matching_v3 import KEY_S1_LIMITS, KEY_TARGET_LIMIT, block_keys, pair_features
+from matching_v3 import (
+    KEY_S1_LIMITS, KEY_TARGET_LIMIT, SINGLETON_GUARD_THRESHOLD,
+    block_keys, pair_features,
+)
 from train_v3 import BATCH, MAX_CANDIDATES_PER_SOURCE, MAX_CANDIDATES_DEEP, DEEP_CANDIDATE_THRESHOLD, quoted
 
 
@@ -284,6 +287,7 @@ def write_outputs(
     global_threshold: float = config["decision_threshold"]
     country_thresholds: dict[str, float] = config.get("country_thresholds", {})
     apply_me: bool = config.get("mutual_exclusivity_suppression", False)
+    singleton_guard: float = config.get("singleton_guard_threshold", SINGLETON_GUARD_THRESHOLD)
 
     # Build target address lookup for C2
     target_addresses: dict[str, str] = {}
@@ -295,6 +299,23 @@ def write_outputs(
     s1_country: dict[int, str] = {}
     for ix, country in con.execute("SELECT ix, country FROM s1").fetchall():
         s1_country[ix] = country or ""
+
+    # C3: pre-compute per-s1 max probability in a single pass over the scored array
+    log("C3: computing per-S1 max probability for singleton guard")
+    n_s1 = con.execute("SELECT count(*) FROM s1").fetchone()[0]
+    max_prob_per_s1: np.ndarray = np.zeros(n_s1, dtype=np.float32)
+    order_cursor = con.cursor().execute(
+        f"SELECT c.s1_ix FROM candidates c WHERE c.rank<={cap} ORDER BY c.s1_ix, c.target_ix"
+    )
+    for offset_start in range(0, len(probabilities), 100_000):
+        chunk_size = min(100_000, len(probabilities) - offset_start)
+        rows = order_cursor.fetchmany(chunk_size)
+        if not rows:
+            break
+        for rel_i, (s1_ix,) in enumerate(rows):
+            p = float(probabilities[offset_start + rel_i])
+            if p > max_prob_per_s1[s1_ix]:
+                max_prob_per_s1[s1_ix] = p
 
     s1_cursor = con.cursor().execute("SELECT ix,entity_id FROM s1 ORDER BY ix")
     pair_cursor = con.cursor().execute(f"""
@@ -328,6 +349,11 @@ def write_outputs(
                     offset += 1
                     pair_count += 1
                     pair = pair_cursor.fetchone()
+
+                # C3: singleton guard — if entity's max prob < guard, predict empty
+                if singleton_guard > 0.0 and max_prob_per_s1[s1_ix] < singleton_guard:
+                    match_count -= len(matched_ids)
+                    matched_ids = []
 
                 # C2: mutual exclusivity suppression
                 if apply_me and len(matched_ids) > 1:
