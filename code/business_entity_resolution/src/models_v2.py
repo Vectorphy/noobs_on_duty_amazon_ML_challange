@@ -78,6 +78,8 @@ class _LightGBMTensorBoard:
     def __call__(self, env) -> None:
         for dataset, metric, value, *_ in env.evaluation_result_list or ():
             self.writer.add_scalar(f"{dataset}/{metric}", float(value), env.iteration + 1)
+        if (env.iteration + 1) % 25 == 0:
+            self.writer.flush()
 
 
 def _xgboost_tensorboard(writer):
@@ -93,6 +95,8 @@ def _xgboost_tensorboard(writer):
                     if isinstance(value, tuple):
                         value = value[0]
                     writer.add_scalar(f"{dataset}/{metric}", float(value), epoch + 1)
+            if (epoch + 1) % 25 == 0:
+                writer.flush()
             return False
 
     return Callback()
@@ -104,14 +108,18 @@ def _writer(tensorboard_dir: Path | None, stage: str):
     try:
         from tensorboardX import SummaryWriter
     except ImportError:
-        print("TensorBoard is unavailable; install requirements-models.txt for event logs.", flush=True)
-        return None
-    return SummaryWriter(str(tensorboard_dir / safe_name(stage)))
+        raise ImportError(
+            "TensorBoard logging is enabled but tensorboardX is missing. "
+            "Install code/business_entity_resolution/requirements-models.txt."
+        ) from None
+    return SummaryWriter(str(tensorboard_dir / safe_name(stage)), max_queue=10, flush_secs=5)
 
 
 def fit_model(model_name: str, model, x, y, *, stage: str,
               checkpoint_dir: Path, signature: dict,
-              tensorboard_dir: Path | None = None):
+              tensorboard_dir: Path | None = None,
+              validation_data: tuple | None = None,
+              early_stopping_rounds: int = 50):
     """Fit once per signature, reusing completed fits and native snapshots."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     stage = safe_name(stage)
@@ -140,6 +148,8 @@ def fit_model(model_name: str, model, x, y, *, stage: str,
 
     writer = _writer(tensorboard_dir, stage)
     try:
+        parameters = model.get_params()
+        target_rounds = int(parameters.get("n_estimators", parameters.get("iterations", TREE_COUNT)))
         # A fixed training-only subset supplies per-iteration loss monitoring.
         rng = np.random.default_rng(42)
         monitor_ix = rng.choice(len(y), min(len(y), MONITOR_ROWS), replace=False)
@@ -158,17 +168,28 @@ def fit_model(model_name: str, model, x, y, *, stage: str,
                     os.replace(tmp, native_path)
 
             callbacks = [lgb.log_evaluation(period=25), checkpoint]
+            if validation_data is not None:
+                callbacks.append(lgb.early_stopping(
+                    stopping_rounds=early_stopping_rounds,
+                    first_metric_only=True, verbose=True,
+                ))
             if writer is not None:
                 history = {}
                 callbacks.extend((lgb.record_evaluation(history), _LightGBMTensorBoard(writer)))
+            if validation_data is not None:
+                fit_eval = [(validation_data[0], validation_data[1])]
+                fit_eval_names = ["development"]
+            else:
+                fit_eval = eval_set
+                fit_eval_names = ["training_monitor"]
             if native_path.exists():
                 initial = lgb.Booster(model_file=str(native_path))
-                remaining = max(1, TREE_COUNT - initial.current_iteration())
+                remaining = max(1, target_rounds - initial.current_iteration())
                 model.set_params(n_estimators=remaining)
-                model.fit(x, y, eval_set=eval_set, eval_names=["training_monitor"],
+                model.fit(x, y, eval_set=fit_eval, eval_names=fit_eval_names,
                           eval_metric="binary_logloss", callbacks=callbacks, init_model=initial)
             else:
-                model.fit(x, y, eval_set=eval_set, eval_names=["training_monitor"],
+                model.fit(x, y, eval_set=fit_eval, eval_names=fit_eval_names,
                           eval_metric="binary_logloss", callbacks=callbacks)
             if writer is not None:
                 writer.flush()
@@ -190,7 +211,7 @@ def fit_model(model_name: str, model, x, y, *, stage: str,
             if snapshots:
                 resume = xgb.Booster()
                 resume.load_model(str(snapshots[-1]))
-                model.set_params(n_estimators=max(1, TREE_COUNT - resume.num_boosted_rounds()))
+                model.set_params(n_estimators=max(1, target_rounds - resume.num_boosted_rounds()))
             model.fit(x, y, eval_set=eval_set, verbose=25, xgb_model=resume)
             # Callbacks may be local classes or hold a TensorBoard writer; do not
             # serialize those training-only objects into the reusable estimator.

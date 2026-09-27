@@ -33,6 +33,7 @@ from models_v2 import (
 SEED = 42
 CAPS = (16, 24, 32)
 MAX_NEGATIVES = 6_000_000
+TRAIN_SELECTION_VERSION = "uniform-negative-ranks-1-32-v1"
 SELECT_PAIRS = 1_000_000
 BATCH = 20_000
 META_DTYPE = np.dtype([
@@ -312,12 +313,43 @@ def make_train_selection(con: duckdb.DuckDBPyConnection) -> dict:
         SELECT c.* FROM candidates c JOIN s1 s ON c.s1_ix=s.ix
         ANTI JOIN links l ON l.s1_ix=c.s1_ix AND l.target_ix=c.target_ix
         WHERE s.split=0
-        ORDER BY CASE WHEN c.rank<=4 THEN 0 ELSE 1 END,
-                 hash(c.s1_ix::VARCHAR || ':' || c.target_ix::VARCHAR || ':42')
+        ORDER BY hash(c.s1_ix::VARCHAR || ':' || c.target_ix::VARCHAR || ':42'),
+                 c.s1_ix,c.target_ix
         LIMIT {MAX_NEGATIVES}
     """)
     result = {"retrieved_train_positives": positives, "sampled_train_negatives": count(con, "train_selected")-positives}
+    ranks = con.execute("""
+        SELECT c.rank, count(*) FROM train_selected c ANTI JOIN links l
+          ON c.s1_ix=l.s1_ix AND c.target_ix=l.target_ix
+        GROUP BY c.rank ORDER BY c.rank
+    """).fetchall()
+    result["negative_pairs_by_rank"] = {str(rank): rows for rank, rows in ranks}
     log(f"Training pairs: {positives:,} positives, {result['sampled_train_negatives']:,} negatives")
+    log("Sampled negative pairs by candidate rank: " + json.dumps(result["negative_pairs_by_rank"], sort_keys=True))
+    return result
+
+
+def ensure_train_selection(con: duckdb.DuckDBPyConnection, work: Path) -> dict:
+    """Rebuild only the bounded pair sample when its sampling rule changes."""
+    marker = work / "train_selection_version.json"
+    previous = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else {}
+    if previous.get("version") != TRAIN_SELECTION_VERSION:
+        drop_tables(con, ("train_selected",))
+        con.execute("DELETE FROM pipeline_progress WHERE name='train_selection'")
+        for name in ("train_features.npy", "train_meta.npy", "train_complete.json", "train_progress.json"):
+            (work / name).unlink(missing_ok=True)
+        log(f"Invalidated old training sample/features (selection version {previous.get('version', 'unknown')})")
+    if not stage_done(con, "train_selection"):
+        result = make_train_selection(con)
+        mark_stage(con, "train_selection")
+    else:
+        selected = count(con, "train_selected")
+        positive = con.execute("""SELECT count(*) FROM train_selected c JOIN links l
+            ON c.s1_ix=l.s1_ix AND c.target_ix=l.target_ix""").fetchone()[0]
+        result = {"retrieved_train_positives": positive,
+                  "sampled_train_negatives": selected-positive}
+        log("Reusing versioned training-pair selection")
+    atomic_json(marker, {"version": TRAIN_SELECTION_VERSION, **result})
     return result
 
 
@@ -352,6 +384,24 @@ def extract_features(con: duckdb.DuckDBPyConnection, work: Path, name: str,
         if saved.get("signature") == signature and saved.get("complete"):
             log(f"Reusing completed {name} features: {n:,} rows")
             return np.load(x_path,mmap_mode="r"),np.load(meta_path,mmap_mode="r")
+        # Permit only the explicitly verified, frozen baseline development cache
+        # to migrate from its older marker format. Shape alone is not provenance;
+        # validation and training caches are rebuilt if they lack a full signature.
+        migration_path = work / "legacy_feature_cache_migration.json"
+        migration = (json.loads(migration_path.read_text(encoding="utf-8"))
+                     if migration_path.exists() else {})
+        approved = migration.get("verified_caches", {}).get(name, {})
+        if (name == "development" and
+                migration.get("input_signature") == input_signature and
+                migration.get("feature_names") == list(FEATURES) and
+                migration.get("verification", {}).get("baseline_development_macro_f05") is not None and
+                approved == {"rows": n, "cap": cap, "split": split} and
+                saved == {"rows": n, "cap": cap, "split": split} and
+                np.load(x_path, mmap_mode="r").shape == (n, len(FEATURES)) and
+                np.load(meta_path, mmap_mode="r").shape == (n,) and
+                np.load(meta_path, mmap_mode="r").dtype == META_DTYPE):
+            log(f"Reusing migrated, provenance-verified {name} cache: {n:,} rows")
+            return np.load(x_path, mmap_mode="r"), np.load(meta_path, mmap_mode="r")
     log(f"Extracting {name}: {n:,} candidate feature rows")
     progress_path = work/f"{name}_progress.json"
     offset = 0
@@ -611,11 +661,22 @@ def run(data: Path, artifacts: Path, frozen_baseline: bool = False,
     work.mkdir(parents=True, exist_ok=True)
     input_marker = work / "training_input_signature.json"
     database_path = work / "pipeline.duckdb"
-    if input_marker.exists() and json.loads(input_marker.read_text(encoding="utf-8")) != source_signature:
-        for path in (database_path, database_path.with_suffix(database_path.suffix + ".wal")):
-            if path.exists():
-                path.unlink()
-        log("Training data or pipeline code changed; invalidated the old DuckDB stage checkpoints")
+    if input_marker.exists():
+        previous_signature = json.loads(input_marker.read_text(encoding="utf-8"))
+        if previous_signature != source_signature:
+            # A change isolated to training orchestration can preserve the costly
+            # immutable imports, blocks, and candidates. Selection has its own
+            # version marker and is rebuilt below. Data/matching changes still
+            # invalidate the database as before.
+            old_stable = [item for item in previous_signature if item.get("name") != "train_v2.py"]
+            new_stable = [item for item in source_signature if item["name"] != "train_v2.py"]
+            if old_stable != new_stable:
+                for path in (database_path, database_path.with_suffix(database_path.suffix + ".wal")):
+                    if path.exists():
+                        path.unlink()
+                log("Training inputs or matching features changed; invalidated DuckDB stage checkpoints")
+            else:
+                log("Training orchestration changed; preserving imported data and candidates")
     atomic_json(input_marker, source_signature)
     con = connect(work)
     started = time.monotonic()
@@ -638,16 +699,7 @@ def run(data: Path, artifacts: Path, frozen_baseline: bool = False,
             keys = {"s1_keys":count(con,"s1_keys"),"target_keys":count(con,"target_keys")}
             log("Reusing completed blocking keys")
         candidates = build_candidates(con,work)
-        if not stage_done(con,"train_selection"):
-            drop_tables(con,("train_selected",))
-            training = make_train_selection(con)
-            mark_stage(con,"train_selection")
-        else:
-            selected = count(con,"train_selected")
-            positive = con.execute("""SELECT count(*) FROM train_selected c JOIN links l
-                ON c.s1_ix=l.s1_ix AND c.target_ix=l.target_ix""").fetchone()[0]
-            training = {"retrieved_train_positives":positive,"sampled_train_negatives":selected-positive}
-            log("Reusing completed training-pair selection")
+        training = ensure_train_selection(con, work)
         if not (artifacts/"split_assignments.parquet").exists():
             con.execute(f"COPY (SELECT entity_id,split FROM s1 ORDER BY ix) TO {quoted(artifacts/'split_assignments.parquet')} (FORMAT PARQUET)")
         base_cols = tuple(range(len(BASE_FEATURES)))

@@ -58,6 +58,23 @@ is separate from the baseline environment. Verify that wheels are available
 for the Python version used before installing; if not, use a supported Python
 environment. LightGBM remains the default for existing notebook and CLI runs.
 
+### Experimental BM25S retrieval pilot
+
+The label-blind retrieval pilot compares the existing SciPy prototype with an
+optional BM25S/Numba backend. It does not change the submission inference path.
+Install the isolated dependencies and run the pilot from the repository root:
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe -r code\business_entity_resolution\requirements-retrieval.txt
+uv run --python .venv\Scripts\python.exe code\business_entity_resolution\src\retrieval_v2.py --backend bm25s
+```
+
+Pilot outputs and findings are under
+`code/business_entity_resolution/artifacts/v2/tuning/retrieval/`. BM25S was
+about 16.5× faster than the SciPy prototype on the saved sample, with similar
+retrieval recall. It still needs a complete development candidate oracle before
+use in model training or inference.
+
 The run requires at
 least 3.5 GiB available RAM and 25 GiB free disk at its start. Its DuckDB work
 database and feature arrays stay under `artifacts/v2/work/`; test inference uses

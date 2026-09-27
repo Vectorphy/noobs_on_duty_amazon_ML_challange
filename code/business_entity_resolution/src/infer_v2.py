@@ -21,6 +21,8 @@ from matching_v2 import (
 )
 from train_v2 import BATCH, MAX_CANDIDATES_PER_SOURCE, quoted
 
+TARGET_INDEX_VERSION = "source-and-entity-id-order-v1"
+
 
 def log(message: str) -> None:
     print(time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
@@ -35,7 +37,8 @@ def input_signature(paths: list[Path], config: dict, model_path: Path) -> str:
     model = {"size": model_path.stat().st_size, "mtime_ns": model_path.stat().st_mtime_ns}
     return json.dumps({"files": files, "model_config": config,
                        "model": model, "candidate_cap": config["candidate_cap_per_source"],
-                       "feature_engine": FEATURE_ENGINE_VERSION, "code": code},
+                       "feature_engine": FEATURE_ENGINE_VERSION,
+                       "target_index_version": TARGET_INDEX_VERSION, "code": code},
                       sort_keys=True, default=list)
 
 
@@ -63,7 +66,7 @@ def build_database(test_dir: Path, work: Path) -> duckdb.DuckDBPyConnection:
     """)
     con.execute(f"""
         CREATE OR REPLACE TABLE targets AS
-        SELECT CAST(row_number() OVER ()-1 AS INTEGER) ix, entity_id,
+        SELECT CAST(row_number() OVER (ORDER BY source_no,entity_id)-1 AS INTEGER) ix, entity_id,
                coalesce(business_name,'') business_name,
                coalesce(business_address,'') business_address, country, source_no
         FROM (
