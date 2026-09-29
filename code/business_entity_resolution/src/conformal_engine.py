@@ -2,7 +2,6 @@
 Robust Conformal Prediction Framework for Business Entity Resolution
 Amazon ML Challenge 2026
 
-Author: Principal ML Scientist & Distribution-Free UQ Lead
 Mathematical Principles:
 1. Platt / Temperature Scaling for Probability Calibration
 2. Mondrian (Class-Conditional) Conformal Prediction under Severe ER Imbalance

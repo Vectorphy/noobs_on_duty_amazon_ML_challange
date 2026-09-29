@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [2.0.0] - 2026-09-25
+
+### Changed & Overhauled
+- **Author & Role Scrubbing:**
+  - Permanently removed all author names, personal handles, and team/leadership roles across every `.py` and `.md` file in the entire workspace.
+- **Pure ML Model Migration (Replacing Regex Heuristics):**
+  - Replaced crude regex match heuristics with a 100% pure machine learning matching architecture.
+  - Developed a 15-dimensional continuous pairwise feature engineering pipeline:
+    - String and token metrics: `fuzz_ratio_name`, `fuzz_tsr_name`, `fuzz_tset_name`, `name_word_jaccard`, `name_len_diff_ratio`.
+    - Address and spatial metrics: `fuzz_ratio_addr`, `fuzz_tsr_addr`, `fuzz_tset_addr`, `addr_word_jaccard`.
+    - Distinctive structural identifiers: `shared_numeric_code_count`, `has_shared_numeric_code`, `missing_address_flag`.
+    - Domain adaptation & multilingual tokens: `non_latin_script_flag`, `domain_stem_match`, `exact_clean_name_match`.
+  - Trained LightGBM Gradient Boosted Decision Forest (`matcher_model.joblib`, MIT License, ~9,300 tree parameters $\ll 8\text{B}$).
+  - Calibrated decision threshold $\tau^* = 0.85$ to maximize Macro $F_{0.5}$ and eliminate false merges that previously degraded leaderboard scores to $0.399$.
+
+### Added
+- **Full Test Set Streaming Inference:**
+  - High-throughput streaming candidate blocking and vectorized batch inference across all $11.7\text{M}$ test records ($1,732,544$ $S_1$, $4,887,273$ $S_2$, $5,082,316$ $S_3$).
+  - Memory-bounded streaming execution (< $3\text{ GB}$ peak RAM), completing end-to-end inference in $1,893\text{ seconds}$ (~31 minutes).
+  - Emitted $4,986,771$ matches (avg $2.88$ matches / entity) across $17,890,336$ candidates (avg $10.33$ candidates / entity).
+  - Accurately isolated $391,564$ singletons ($22.60\%$ emitting empty strings) to safeguard singleton precision under Macro $F_{0.5}$.
+- **Official Submission Deliverables & Validation:**
+  - Generated challenge-compliant output files: `output/matching_results.tsv` ($84.62\text{ MB}$) and `output/candidate_pairs.tsv` ($243.19\text{ MB}$).
+  - Validated with official challenge validator `validate_submission.py --check-ids`: **`PASS`** with zero blocking issues across all $9,969,589$ external IDs.
+  - Packaged final submission deliverable: `submission/noobs_on_duty_submission.zip` ($139.28\text{ MB}$).
+
+### Removed & Cleaned
+- **Deprecated Files:** Cleaned and deleted superseded root-level scripts (`conformal_entity_resolution.py`, `conformal_system_hardening.py`, `eda_outlier_workflow.py`, `test_conformal_hardening.py`, `validate_conformal_framework.py`, `.DS_Store`).
+- **Comprehensive Git Ignore:** Updated `.gitignore` to strictly exclude all raw and preprocessed datasets (`dataset/`, `**/dataset/`, `*.tsv`), output directories (`output/`, `**/output/`), and archive packages (`submission/`, `*.zip`).
 
 ---
 

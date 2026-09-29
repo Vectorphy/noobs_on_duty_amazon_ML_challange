@@ -1,18 +1,13 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*.class
+*$py.class
+*.so
 
 # OS artifacts
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Large dataset files and raw outputs (> 100MB)
-dataset/
-*.tsv
-*.zip
-*.tar.gz
 
 # Environment and IDE
 .env
@@ -24,3 +19,36 @@ venv/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints
+
+# Datasets (strictly ignored)
+dataset/
+**/dataset/
+*.tsv
+
+# Outputs and submission archives (> 100MB)
+output/
+**/output/
+submission/
+**/submission/
+*.zip
+
+# Scratch and temporary scripts
+scratch_*.py
+scratch/
+.uv-cache/
+code/business_entity_resolution/artifacts/v2/**/work/
+code/business_entity_resolution/artifacts/v2/fixture/
+code/business_entity_resolution/artifacts/v2/**/test_work/
+code/business_entity_resolution/artifacts/v2/tensorboard/
+code/business_entity_resolution/artifacts/v2/test_output/
+code/business_entity_resolution/artifacts/v2_colab/
+code/business_entity_resolution/artifacts/bm25_pipeline/
+code/business_entity_resolution/artifacts/v2/**/*.joblib
+code/business_entity_resolution/artifacts/v2/model_config.json
+code/business_entity_resolution/artifacts/v2/training_metrics.json
+code/business_entity_resolution/artifacts/v2/split_assignments.parquet
+code/business_entity_resolution/artifacts/v2/tuning/**
+!code/business_entity_resolution/artifacts/v2/tuning/retrieval/
+code/business_entity_resolution/artifacts/v2/tuning/retrieval/*
+!code/business_entity_resolution/artifacts/v2/tuning/retrieval/*.md
+!code/business_entity_resolution/artifacts/v2/tuning/retrieval/bm25_pilot_report*.json

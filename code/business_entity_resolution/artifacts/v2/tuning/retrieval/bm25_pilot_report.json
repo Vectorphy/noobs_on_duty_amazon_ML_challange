@@ -1,0 +1,151 @@
+{
+  "method": "country-specific character-trigram BM25 over name plus address",
+  "backend": "bm25s",
+  "seed": 42,
+  "labels_used_for_retrieval": false,
+  "retrieval_direction": "sampled S2/S3 targets query sampled development S1 references",
+  "docs_per_country_limit": 150000,
+  "targets_per_country_limit": 20000,
+  "actual_documents": 165592,
+  "actual_queries": 40000,
+  "country_runtime": {
+    "India": {
+      "documents": 66355,
+      "queries": 20000,
+      "seconds": 17.74,
+      "query_pairs_per_second": 1127.14
+    },
+    "US": {
+      "documents": 99237,
+      "queries": 20000,
+      "seconds": 9.09,
+      "query_pairs_per_second": 2201.12
+    }
+  },
+  "metrics": [
+    {
+      "cap_per_target": 32,
+      "candidate_pairs": 1280000,
+      "baseline_candidate_pairs_in_pilot": 32104,
+      "missed_link_diagnosis": {
+        "2": {
+          "eligible_positive_links": 2040,
+          "no_raw_key_overlap": 9,
+          "pruned_by_frequency_filters": 221,
+          "lost_beyond_current_rank_32": 126,
+          "recovered_by_bm25": 339
+        },
+        "3": {
+          "eligible_positive_links": 280,
+          "no_raw_key_overlap": 4,
+          "pruned_by_frequency_filters": 33,
+          "lost_beyond_current_rank_32": 14,
+          "recovered_by_bm25": 49
+        }
+      },
+      "by_target_source": {
+        "2": {
+          "eligible_positive_links": 2040,
+          "baseline_recalled": 1684,
+          "bm25_recalled": 2023,
+          "union_recalled": 2023,
+          "baseline_recall": 0.8254901960784313,
+          "bm25_recall": 0.9916666666666667,
+          "union_recall": 0.9916666666666667
+        },
+        "3": {
+          "eligible_positive_links": 280,
+          "baseline_recalled": 229,
+          "bm25_recalled": 278,
+          "union_recalled": 278,
+          "baseline_recall": 0.8178571428571428,
+          "bm25_recall": 0.9928571428571429,
+          "union_recall": 0.9928571428571429
+        }
+      }
+    },
+    {
+      "cap_per_target": 64,
+      "candidate_pairs": 2560000,
+      "baseline_candidate_pairs_in_pilot": 32104,
+      "missed_link_diagnosis": {
+        "2": {
+          "eligible_positive_links": 2040,
+          "no_raw_key_overlap": 9,
+          "pruned_by_frequency_filters": 221,
+          "lost_beyond_current_rank_32": 126,
+          "recovered_by_bm25": 344
+        },
+        "3": {
+          "eligible_positive_links": 280,
+          "no_raw_key_overlap": 4,
+          "pruned_by_frequency_filters": 33,
+          "lost_beyond_current_rank_32": 14,
+          "recovered_by_bm25": 49
+        }
+      },
+      "by_target_source": {
+        "2": {
+          "eligible_positive_links": 2040,
+          "baseline_recalled": 1684,
+          "bm25_recalled": 2028,
+          "union_recalled": 2028,
+          "baseline_recall": 0.8254901960784313,
+          "bm25_recall": 0.9941176470588236,
+          "union_recall": 0.9941176470588236
+        },
+        "3": {
+          "eligible_positive_links": 280,
+          "baseline_recalled": 229,
+          "bm25_recalled": 278,
+          "union_recalled": 278,
+          "baseline_recall": 0.8178571428571428,
+          "bm25_recall": 0.9928571428571429,
+          "union_recall": 0.9928571428571429
+        }
+      }
+    },
+    {
+      "cap_per_target": 128,
+      "candidate_pairs": 5120000,
+      "baseline_candidate_pairs_in_pilot": 32104,
+      "missed_link_diagnosis": {
+        "2": {
+          "eligible_positive_links": 2040,
+          "no_raw_key_overlap": 9,
+          "pruned_by_frequency_filters": 221,
+          "lost_beyond_current_rank_32": 126,
+          "recovered_by_bm25": 347
+        },
+        "3": {
+          "eligible_positive_links": 280,
+          "no_raw_key_overlap": 4,
+          "pruned_by_frequency_filters": 33,
+          "lost_beyond_current_rank_32": 14,
+          "recovered_by_bm25": 50
+        }
+      },
+      "by_target_source": {
+        "2": {
+          "eligible_positive_links": 2040,
+          "baseline_recalled": 1684,
+          "bm25_recalled": 2031,
+          "union_recalled": 2031,
+          "baseline_recall": 0.8254901960784313,
+          "bm25_recall": 0.9955882352941177,
+          "union_recall": 0.9955882352941177
+        },
+        "3": {
+          "eligible_positive_links": 280,
+          "baseline_recalled": 229,
+          "bm25_recalled": 279,
+          "union_recalled": 279,
+          "baseline_recall": 0.8178571428571428,
+          "bm25_recall": 0.9964285714285714,
+          "union_recall": 0.9964285714285714
+        }
+      }
+    }
+  ],
+  "pair_file": "..\\artifacts\\v2\\tuning\\retrieval\\bm25_pilot_pairs.tsv"
+}

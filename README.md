@@ -1,7 +1,5 @@
 # Amazon ML Challenge 2026: Business Entity Resolution
 
-**Team Name:** noobs_on_duty  
-**Team Members:** Pranav Dudhal (Team Leader), Sarthak Ojha, Kunal Dhamal, Manish Mukund Bhoir  
 **Competition:** Amazon ML Challenge 2026  
 **Metric:** Macro {0.5}$ Score (Precision-Weighted)  
 
